@@ -324,4 +324,4 @@ A damaged Advance Wars there has to stop at its bad jump.
 
 ## Releases
 
-Older releases (including v0.5) remain on the [Releases](https://github.com/andymcca/lr-gpsp-nspire/releases) page. This commit restores the tested v0.4.1 sources on `main`.
+Older releases remain on the releases page.
