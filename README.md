@@ -130,15 +130,34 @@ it was last in.
 **Touchpad swipes.** In **Configure input**, swipe mode tracks the movement
 from the start of a finger contact instead of treating a touch location as a
 direction. A rightward swipe activates `SW-RIGHT`; an upward swipe activates
-`SW-UP`. Diagonal movement activates its X and Y component inputs independently
-and also a dedicated diagonal input (`SW-UPLEFT`, `SW-UPRIGHT`, `SW-DNLEFT`, or
-`SW-DNRIGHT`). Each axis is normalized against the touchpad's own width or
+`SW-UP`. Diagonal movement activates its X and Y component inputs independently.
+Each axis is normalized against the touchpad's own width or
 height, so the CX II's 4:3 touchpad is handled consistently. **Swipe dead zone**
 filters small movement, and **Swipe sensitivity** scales movement before the
 dead-zone threshold. Virtual swipe inputs may be paired with a physical
 calculator key. Reusing the same swipe or key in multiple GBA action rows makes
 one input activate multiple GBA buttons. Turning swipe mode off restores the
 older edge-arrow controls.
+
+**Touchpad Glide.** In the same menu, Glide is a separate option that starts
+off. The first contact sets an anchor; movement beyond the normalized dead
+zone updates its relative direction. That direction stays latched while the
+finger rests and clears when contact ends. The angle is split into horizontal
+and vertical components, then Q12 duty-cycle pulses approximate their
+cosine/sine weights with digital GBA buttons. **Glide weighting** selects
+physical 4:3 angle matching or equal weighting of each normalized touchpad
+span. The dead zone defaults to 8% of the shorter weighted span, and X/Y can
+be inverted independently. Each direction has its own checklist for mapping
+any number of the ten GBA buttons. Glide settings and maps can be saved for
+all games or for one game.
+
+**Glide smoothing and input separation.** The same menu can enable Glide
+smoothing, choose Low/Medium/High strength, and adjust its grouped holds and
+axis hysteresis. With smoothing off, Glide keeps its direct response. Input
+separation can stay Off, use **Smart (Chords)** to keep single-button inputs
+together while time-slicing multi-button mappings, or use **Separate All** to
+time-slice every input source. Slice length is configurable from 1 to 6 frames
+(default 2). These settings are saved globally and per game.
 
 **Save states.** Slots 0 to 999, named as before (`Game.gba12.svs.tns`, in
 `zgpSP_saves`), so older states still load. In *Cheats and Miscellaneous options*:

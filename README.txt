@@ -43,13 +43,34 @@ Touchpad swipe controls
   sensitivity. Inputs are based on movement from the start of a finger contact,
   not the location where the finger first touches. Swipe right triggers
   SW-RIGHT and swipe up triggers SW-UP. Diagonal swipes activate X and Y
-  components separately and also expose SW-UPLEFT, SW-UPRIGHT, SW-DNLEFT, and
-  SW-DNRIGHT. The X and Y components are normalized against the reported
+  components separately. The X and Y components are normalized against the reported
   touchpad width and height, respecting the CX II's 4:3 ratio. The dead zone
   filters small movement and sensitivity scales it before checking the zone.
   You can map a swipe together with a physical calculator key, and reuse a
   swipe or physical key in multiple GBA action rows to activate several GBA
   buttons at once. Turn swipes off to restore the original edge-arrow controls.
+
+Touchpad glide
+--------------
+  Configure input also has a separate Touchpad Glide option, off by default.
+  The first contact sets an anchor. Movement beyond the normalized dead zone
+  updates a latched direction, which remains active while the finger rests and
+  clears when contact ends. Angle projections become proportional digital
+  button pulses. Glide weighting selects physical 4:3 angle matching or equal
+  weighting for each normalized touchpad span. The dead zone defaults to 8%
+  of the shorter weighted span; X and Y can be inverted. Each direction has a
+  checklist for any of the ten GBA buttons. Settings and maps can be saved for
+  all games or for one game.
+
+Glide smoothing and input separation
+------------------------------------
+  Configure input can enable Glide smoothing and choose Low, Medium, or High
+  strength. Smoothing applies a fixed-point angle filter, axis hysteresis, and
+  grouped direction holds; turning it off keeps the direct response. Input
+  separation can stay Off, use Smart (Chords) to keep single-button inputs
+  together while slicing multi-button mappings, or use Separate All to slice
+  every input source. Slice length is 1 to 6 frames (default 2). These options
+  are saved globally and per game.
 
 Ndless metadata (genzehn)
 -------------------------
