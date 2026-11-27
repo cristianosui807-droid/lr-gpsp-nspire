@@ -494,6 +494,11 @@ static int held(unsigned key)
 
 /* Stable 4:3 touchpad dimensions for the host build. On the calculator,
  * touchpad_getinfo() supplies the real hardware dimensions. */
+int unit_is_touchpad(void)
+{
+  return 1;
+}
+
 touchpad_info_t *touchpad_getinfo(void)
 {
   static touchpad_info_t info = { 320, 240 };

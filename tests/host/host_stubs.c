@@ -12,6 +12,15 @@
 static uint32_t unit_keypad[4];
 static touchpad_report_t unit_touchpad_report;
 static u32 unit_ticks;
+unsigned unit_touchpad_scan_calls;
+unsigned unit_touchpad_info_calls;
+unsigned unit_touchpad_availability_checks;
+
+int unit_is_touchpad(void)
+{
+  unit_touchpad_availability_checks++;
+  return 1;
+}
 
 void unit_set_key(unsigned key, int down)
 {
@@ -82,11 +91,13 @@ void nspire_osd_message(const char *format, ...)
 touchpad_info_t *touchpad_getinfo(void)
 {
   static touchpad_info_t info = { 320, 240 };
+  unit_touchpad_info_calls++;
   return &info;
 }
 
 int touchpad_scan(touchpad_report_t *report)
 {
+  unit_touchpad_scan_calls++;
   *report = unit_touchpad_report;
   return 0;
 }

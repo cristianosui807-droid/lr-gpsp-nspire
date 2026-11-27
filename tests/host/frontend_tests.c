@@ -45,6 +45,9 @@ static char dir[512];
 extern uint32_t unit_backlight;
 extern long unit_backlight_writes;
 extern char unit_osd_message[64];
+extern unsigned unit_touchpad_scan_calls;
+extern unsigned unit_touchpad_info_calls;
+extern unsigned unit_touchpad_availability_checks;
 
 #define PORTRAIT (240 * 320)
 #define SENTINEL 0xBEEF
@@ -235,6 +238,8 @@ static void test_swipe_input_pipeline(void)
   unit_set_touchpad(0, 100, 100);
   nspire_input_release_all();
   keys_poll();
+  CHECK(unit_touchpad_availability_checks == 1 && unit_touchpad_info_calls == 1,
+        "touchpad availability and dimensions are checked once at initialization");
 
   /* Touch establishes a relative origin; it must not trigger a direction. */
   unit_set_touchpad(1, 100, 100);
@@ -242,13 +247,11 @@ static void test_swipe_input_pipeline(void)
   CHECK(!key_down(KEY_SWIPE_RIGHT) && !key_down(KEY_SWIPE_UP),
         "touching the pad without moving does not trigger swipe inputs");
 
-  /* A right/up diagonal on the 4:3 pad activates separate X and Y components
-   * plus its dedicated 8-way gesture input. */
+  /* A right/up diagonal on the 4:3 pad activates separate X and Y components. */
   unit_set_touchpad(1, 160, 130);
   keys_poll();
-  CHECK(key_down(KEY_SWIPE_RIGHT) && key_down(KEY_SWIPE_UP) &&
-        key_down(KEY_SWIPE_UP_RIGHT),
-        "diagonal movement activates its X, Y, and diagonal swipe inputs");
+  CHECK(key_down(KEY_SWIPE_RIGHT) && key_down(KEY_SWIPE_UP),
+        "diagonal movement activates its independent X and Y swipe inputs");
 
   /* A swipe may bind to more than one GBA button. A separate combination
    * binds the same swipe plus SHIFT to A. */
@@ -281,6 +284,385 @@ static void test_swipe_input_pipeline(void)
   unit_set_touchpad(0, 100, 100);
 }
 
+static void test_glide_input_pipeline(void)
+{
+  u32 p1, before_scans;
+  unsigned i, right_pulses, up_pulses;
+  const u32 glide_combo = BUTTON_A | BUTTON_B;
+
+  nspire_touchpad_swipe = 0;
+  nspire_touchpad_glide_enabled = 0;
+  nspire_touchpad_glide_aspect_mode = GLIDE_ASPECT_4_3;
+  nspire_touchpad_glide_deadzone = 8;
+  nspire_touchpad_glide_invert_x = 0;
+  nspire_touchpad_glide_invert_y = 0;
+  memset(nspire_touchpad_glide_masks, 0, sizeof(nspire_touchpad_glide_masks));
+  nspire_touchpad_glide_masks[GLIDE_DIR_RIGHT] = (unsigned short)glide_combo;
+  nspire_touchpad_glide_masks[GLIDE_DIR_UP] = BUTTON_L;
+  nspire_touchpad_glide_masks[GLIDE_DIR_LEFT] = BUTTON_SELECT;
+  nspire_touchpad_glide_masks[GLIDE_DIR_DOWN] = BUTTON_R;
+  keys_set_defaults(key_bindings);
+  unit_set_key(KEY_SHIFT, 0);
+  unit_set_touchpad(0, 100, 100);
+  nspire_input_release_all();
+
+  /* Off bypasses the new mapping. */
+  unit_set_touchpad(1, 100, 100);
+  nspire_input_frame();
+  unit_set_touchpad(1, 160, 100);
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK((p1 & glide_combo) == glide_combo, "glide off does not press its mapped buttons");
+
+  /* The new contact establishes an anchor. A diagonal delta independently
+   * triggers right/up, and the one frame poll is shared. */
+  nspire_touchpad_glide_enabled = 1;
+  unit_set_touchpad(0, 160, 100);
+  nspire_input_frame();
+  unit_set_touchpad(1, 100, 100);
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK((p1 & (glide_combo | BUTTON_L)) == (glide_combo | BUTTON_L),
+        "first contact only establishes a baseline");
+  unit_set_touchpad(1, 130, 130);
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK((p1 & (glide_combo | BUTTON_L)) == 0,
+        "first contact emits nothing and diagonal movement activates both axis maps");
+
+  /* A pause keeps the diagonal latched and emits its proportional pulses. */
+  before_scans = unit_touchpad_scan_calls;
+  unit_set_touchpad(1, 130, 130);
+  nspire_input_frame();
+  CHECK(unit_touchpad_scan_calls == before_scans + 1,
+        "glide reuses the existing single touchpad poll for a game frame");
+  p1 = read_ioreg(REG_P1);
+  CHECK((p1 & (glide_combo | BUTTON_L)) == 0, "latched diagonal keeps pulsing during a pause");
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK((p1 & (glide_combo | BUTTON_L)) == 0, "latched components retain their pulse remainder");
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK((p1 & (glide_combo | BUTTON_L)) == (glide_combo | BUTTON_L),
+        "fractional angle weighting leaves occasional digital release frames");
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK((p1 & (glide_combo | BUTTON_L)) == 0, "latched glide resumes its proportional pulse cycle");
+
+  /* Sub-deadzone steps accumulate from the unchanged anchor. */
+  unit_set_touchpad(0, 100, 100);
+  nspire_input_frame();
+  unit_set_touchpad(1, 100, 100);
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK((p1 & (glide_combo | BUTTON_L)) == (glide_combo | BUTTON_L),
+        "a new touch at a distant coordinate does not create a jump");
+  unit_set_touchpad(1, 110, 100);
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK((p1 & glide_combo) == glide_combo, "a short step below the threshold is ignored");
+  unit_set_touchpad(1, 120, 100);
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK((p1 & glide_combo) == 0,
+        "sub-deadzone travel accumulates until the anchor delta crosses the threshold");
+
+  /* Full diagonal samples distinguish physical 4:3 weighting from equal
+   * percentage-of-span weighting using a 30 by 30 raw coordinate change. */
+  nspire_touchpad_glide_deadzone = 1;
+  nspire_touchpad_glide_aspect_mode = GLIDE_ASPECT_4_3;
+  unit_set_touchpad(0, 100, 100);
+  nspire_input_frame();
+  unit_set_touchpad(1, 100, 100);
+  nspire_input_frame();
+  unit_set_touchpad(1, 130, 130);
+  nspire_input_frame();
+  right_pulses = up_pulses = 0;
+  for (i = 0; i < 20; i++)
+  {
+    p1 = read_ioreg(REG_P1);
+    if (!(p1 & glide_combo)) right_pulses++;
+    if (!(p1 & BUTTON_L)) up_pulses++;
+    if (i != 19) nspire_input_frame();
+  }
+  CHECK(right_pulses == up_pulses, "4:3 weighting gives a physical 45-degree diagonal equal pulse rates");
+
+  nspire_touchpad_glide_aspect_mode = GLIDE_ASPECT_EQUAL;
+  unit_set_touchpad(0, 100, 100);
+  nspire_input_frame();
+  unit_set_touchpad(1, 100, 100);
+  nspire_input_frame();
+  unit_set_touchpad(1, 130, 130);
+  nspire_input_frame();
+  right_pulses = up_pulses = 0;
+  for (i = 0; i < 20; i++)
+  {
+    p1 = read_ioreg(REG_P1);
+    if (!(p1 & glide_combo)) right_pulses++;
+    if (!(p1 & BUTTON_L)) up_pulses++;
+    if (i != 19) nspire_input_frame();
+  }
+  CHECK(up_pulses > right_pulses, "equal weighting follows the touchpad's unequal raw axis fractions");
+
+  /* Inversion selects opposite direction maps. */
+  unit_set_touchpad(0, 200, 150);
+  nspire_input_frame();
+  nspire_touchpad_glide_invert_x = 1;
+  nspire_touchpad_glide_invert_y = 1;
+  unit_set_touchpad(1, 200, 150);
+  nspire_input_frame();
+  unit_set_touchpad(1, 230, 180);
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK((p1 & (BUTTON_SELECT | BUTTON_R)) == 0,
+        "invert X and Y reverse both components into left/down maps");
+
+  /* Lift-off clears held mappings immediately, while physical keys merge by
+   * OR with glide buttons in the same frame. */
+  unit_set_touchpad(0, 230, 180);
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK((p1 & (glide_combo | BUTTON_L | BUTTON_SELECT | BUTTON_R)) ==
+        (glide_combo | BUTTON_L | BUTTON_SELECT | BUTTON_R),
+        "contact lift clears active glide outputs immediately");
+
+  nspire_touchpad_glide_invert_x = 0;
+  nspire_touchpad_glide_invert_y = 0;
+  nspire_touchpad_glide_aspect_mode = GLIDE_ASPECT_4_3;
+  unit_set_touchpad(1, 100, 100);
+  nspire_input_frame();
+  unit_set_key(KEY_SHIFT, 1); /* physical Start */
+  unit_set_touchpad(1, 130, 100);
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK(!(p1 & (glide_combo | BUTTON_START)), "physical and glide inputs are OR-merged");
+
+  unit_set_key(KEY_SHIFT, 0);
+  unit_set_touchpad(0, 130, 100);
+  nspire_input_frame();
+  nspire_input_release_all();
+  nspire_touchpad_glide_enabled = 0;
+  nspire_touchpad_glide_smoothing = 0;
+  nspire_touchpad_glide_smooth_strength = GLIDE_SMOOTH_MEDIUM;
+  nspire_input_separation_mode = INPUT_SEPARATION_OFF;
+  nspire_input_slice_frames = 2;
+  nspire_touchpad_glide_invert_x = 0;
+  nspire_touchpad_glide_invert_y = 0;
+  memset(nspire_touchpad_glide_masks, 0, sizeof(nspire_touchpad_glide_masks));
+  keys_set_defaults(key_bindings);
+}
+
+static void test_glide_smoothing(void)
+{
+  u32 p1;
+  unsigned i;
+
+  serial_mode = SERIAL_MODE_DISABLED;
+  nspire_touchpad_swipe = 0;
+  nspire_touchpad_glide_enabled = 1;
+  nspire_touchpad_glide_aspect_mode = GLIDE_ASPECT_4_3;
+  nspire_touchpad_glide_deadzone = 8;
+  nspire_touchpad_glide_invert_x = nspire_touchpad_glide_invert_y = 0;
+  nspire_touchpad_glide_smoothing = 1;
+  nspire_touchpad_glide_smooth_strength = GLIDE_SMOOTH_MEDIUM;
+  nspire_input_separation_mode = INPUT_SEPARATION_OFF;
+  nspire_input_slice_frames = 2;
+  memset(nspire_touchpad_glide_masks, 0, sizeof(nspire_touchpad_glide_masks));
+  nspire_touchpad_glide_masks[GLIDE_DIR_RIGHT] = BUTTON_RIGHT;
+  nspire_touchpad_glide_masks[GLIDE_DIR_UP] = BUTTON_UP;
+  nspire_touchpad_glide_masks[GLIDE_DIR_LEFT] = BUTTON_LEFT;
+  keys_set_defaults(key_bindings);
+  unit_set_key(KEY_8, 0);
+  unit_set_touchpad(0, 100, 100);
+  nspire_input_release_all();
+  nspire_input_frame();
+  unit_set_touchpad(1, 100, 100);
+  nspire_input_frame();
+
+  unit_set_touchpad(1, 130, 100);
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK(!(p1 & BUTTON_RIGHT), "smoothed glide starts with its cardinal direction");
+
+  unit_set_touchpad(1, 130, 130);
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK(!(p1 & BUTTON_RIGHT) && !(p1 & BUTTON_UP),
+        "EMA keeps the previous axis active while easing toward a new angle");
+
+  unit_set_touchpad(0, 200, 100);
+  nspire_input_frame();
+  unit_set_touchpad(1, 200, 100);
+  nspire_input_frame();
+  unit_set_touchpad(1, 170, 100);
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK(!(p1 & BUTTON_LEFT), "fixed-point smoothing preserves negative glide directions");
+
+  /* Hysteresis requires a 0.20 component to enter but keeps an active axis
+   * until it falls below 0.10. Small deltas keep the test near both limits. */
+  nspire_touchpad_glide_smooth_strength = GLIDE_SMOOTH_LOW;
+  nspire_touchpad_glide_deadzone = 1;
+  unit_set_touchpad(0, 100, 30);
+  nspire_input_frame();
+  unit_set_touchpad(1, 100, 30);
+  nspire_input_frame();
+  unit_set_touchpad(1, 101, 37); /* x projection about 0.14: below entry */
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK(p1 & BUTTON_RIGHT, "hysteresis suppresses a grazing inactive axis");
+  {
+    int entered = 0;
+    for (i = 0; i < 4; i++)
+    {
+      unit_set_touchpad(1, (unsigned short)(103 + i * 2),
+                        (unsigned short)(46 + i * 9));
+      nspire_input_frame();
+      p1 = read_ioreg(REG_P1);
+      if (!(p1 & BUTTON_RIGHT))
+        entered = 1;
+    }
+    CHECK(entered, "the horizontal axis enters after its component reaches 0.20");
+  }
+  unit_set_touchpad(1, 110, 80); /* settle below entry but above the 0.10 exit */
+  nspire_input_frame();
+  {
+    unsigned right_pulses = 0;
+    for (i = 0; i < 20; i++)
+    {
+      p1 = read_ioreg(REG_P1);
+      if (!(p1 & BUTTON_RIGHT))
+        right_pulses++;
+      if (i != 19)
+        nspire_input_frame();
+    }
+    CHECK(right_pulses > 0, "the active axis remains pulsed below its entry threshold");
+  }
+  for (i = 0; i < 4; i++)
+  {
+    unit_set_touchpad(1, 110, (unsigned short)(100 + i * 20));
+    nspire_input_frame();
+  }
+  p1 = read_ioreg(REG_P1);
+  CHECK(p1 & BUTTON_RIGHT, "an axis exits only after dropping below its lower threshold");
+
+  /* High strength uses a three-frame grouped pulse; a pure cardinal glide
+   * remains continuously held through the pulse cycle. */
+  nspire_touchpad_glide_smooth_strength = GLIDE_SMOOTH_HIGH;
+  unit_set_touchpad(0, 100, 100);
+  nspire_input_frame();
+  unit_set_touchpad(1, 100, 100);
+  nspire_input_frame();
+  unit_set_touchpad(1, 130, 100);
+  nspire_input_frame();
+  for (i = 0; i < 6; i++)
+  {
+    p1 = read_ioreg(REG_P1);
+    CHECK(!(p1 & BUTTON_RIGHT), "high-strength cardinal output has no frame gaps");
+    if (i != 5)
+      nspire_input_frame();
+  }
+
+  /* Turning smoothing off restores the raw cardinal response. */
+  nspire_touchpad_glide_smoothing = 0;
+  unit_set_touchpad(0, 100, 100);
+  nspire_input_frame();
+  unit_set_touchpad(1, 100, 100);
+  nspire_input_frame();
+  unit_set_touchpad(1, 100, 130);
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK((p1 & BUTTON_RIGHT) && !(p1 & BUTTON_UP),
+        "smoothing off bypasses the EMA and hysteresis state");
+
+  unit_set_touchpad(0, 100, 130);
+  nspire_input_frame();
+  nspire_input_release_all();
+  nspire_touchpad_glide_enabled = 0;
+  nspire_touchpad_glide_smoothing = 0;
+  nspire_touchpad_glide_smooth_strength = GLIDE_SMOOTH_MEDIUM;
+  memset(nspire_touchpad_glide_masks, 0, sizeof(nspire_touchpad_glide_masks));
+  keys_set_defaults(key_bindings);
+}
+
+static void test_input_separation_scheduler(void)
+{
+  u32 p1;
+  const u32 chord = BUTTON_UP | BUTTON_L | BUTTON_R;
+
+  serial_mode = SERIAL_MODE_DISABLED;
+  nspire_touchpad_swipe = 0;
+  nspire_touchpad_glide_enabled = 1;
+  nspire_touchpad_glide_aspect_mode = GLIDE_ASPECT_4_3;
+  nspire_touchpad_glide_deadzone = 8;
+  nspire_touchpad_glide_invert_x = nspire_touchpad_glide_invert_y = 0;
+  nspire_touchpad_glide_smoothing = 0;
+  nspire_touchpad_glide_smooth_strength = GLIDE_SMOOTH_MEDIUM;
+  nspire_input_separation_mode = INPUT_SEPARATION_SMART;
+  nspire_input_slice_frames = 2;
+  memset(nspire_touchpad_glide_masks, 0, sizeof(nspire_touchpad_glide_masks));
+  nspire_touchpad_glide_masks[GLIDE_DIR_UP] = (unsigned short)chord;
+  keys_set_defaults(key_bindings);
+  unit_set_key(KEY_8, 0);
+  unit_set_key(KEY_DEL, 0);
+  unit_set_touchpad(0, 100, 100);
+  nspire_input_release_all();
+  nspire_input_frame();
+
+  unit_set_touchpad(1, 100, 100);
+  unit_set_key(KEY_8, 1); /* D-pad up */
+  nspire_input_frame();
+  unit_set_touchpad(1, 100, 130); /* Glide Up -> Up + L + R */
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK((p1 & chord) == (BUTTON_L | BUTTON_R),
+        "Smart mode keeps the single-button base separate from a chord");
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK((p1 & chord) == (BUTTON_L | BUTTON_R), "Smart base layer uses the configured two-frame slice");
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK((p1 & chord) == 0, "Smart chord layer outputs its exact mask without leaking into the base");
+
+  /* Separate All gives two single-button keys their own round-robin layers. */
+  unit_set_touchpad(0, 100, 130);
+  unit_set_key(KEY_8, 1);
+  unit_set_key(KEY_DEL, 1);
+  nspire_input_separation_mode = INPUT_SEPARATION_ALL;
+  nspire_input_release_all();
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK(!(p1 & BUTTON_UP) && (p1 & BUTTON_A), "Separate All begins with the first key source");
+  nspire_input_frame();
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK((p1 & BUTTON_UP) && !(p1 & BUTTON_A), "Separate All advances after two frames");
+
+  /* Smart combines independent single buttons in its base layer. */
+  nspire_input_separation_mode = INPUT_SEPARATION_SMART;
+  nspire_input_release_all();
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK(!(p1 & BUTTON_UP) && !(p1 & BUTTON_A), "Smart mode keeps ordinary single buttons simultaneous");
+
+  /* Off stays zero-latency OR mode. */
+  nspire_input_separation_mode = INPUT_SEPARATION_OFF;
+  nspire_input_frame();
+  p1 = read_ioreg(REG_P1);
+  CHECK(!(p1 & BUTTON_UP) && !(p1 & BUTTON_A), "separation off retains immediate OR behavior");
+
+  unit_set_key(KEY_8, 0);
+  unit_set_key(KEY_DEL, 0);
+  unit_set_touchpad(0, 100, 130);
+  nspire_input_frame();
+  nspire_input_release_all();
+  nspire_touchpad_glide_enabled = 0;
+  nspire_input_separation_mode = INPUT_SEPARATION_OFF;
+  nspire_input_slice_frames = 2;
+  memset(nspire_touchpad_glide_masks, 0, sizeof(nspire_touchpad_glide_masks));
+  keys_set_defaults(key_bindings);
+}
+
 static void test_keys(void)
 {
   char text[32];
@@ -299,7 +681,8 @@ static void test_keys(void)
 
   CHECK(!strcmp(key_name(KEY_SWIPE_UP), "SW-UP") &&
         !strcmp(key_name(KEY_SWIPE_UP_RIGHT), "SW-UPRIGHT") &&
-        key_is_bindable(KEY_SWIPE_UP_RIGHT), "swipe keys have names and are bindable");
+        !key_is_bindable(KEY_SWIPE_UP_RIGHT),
+        "diagonal swipe names remain recognized but only orthogonal swipes bind");
   CHECK(touchpad_swipe_direction_mask(0, 0, 320, 240, 10, 100) == 0,
         "touching without movement stays in the dead zone");
   CHECK(touchpad_swipe_direction_mask(64, 0, 320, 240, 10, 100) == SWIPE_DIR_RIGHT,
@@ -319,15 +702,15 @@ static void test_keys(void)
   CHECK(touchpad_swipe_direction_mask(20, 0, 0, 240, 10, 100) == 0,
         "zero width is safe");
 
-  b = binding_unpack(KEY_SWIPE_UP_RIGHT | (KEY_SHIFT << 8));
-  CHECK(b.key == KEY_SWIPE_UP_RIGHT && b.with == KEY_SHIFT,
-        "diagonal swipe can combine with a physical key");
-  CHECK(binding_pack(b) == (KEY_SWIPE_UP_RIGHT | (KEY_SHIFT << 8)),
+  b = binding_unpack(KEY_SWIPE_RIGHT | (KEY_SHIFT << 8));
+  CHECK(b.key == KEY_SWIPE_RIGHT && b.with == KEY_SHIFT,
+        "an orthogonal swipe can combine with a physical key");
+  CHECK(binding_pack(b) == (KEY_SWIPE_RIGHT | (KEY_SHIFT << 8)),
         "swipe plus physical key packs and unpacks");
-  key_bindings[ACTION_A][0] = binding_unpack(KEY_SWIPE_UP_RIGHT);
-  key_bindings[ACTION_B][0] = binding_unpack(KEY_SWIPE_UP_RIGHT);
+  key_bindings[ACTION_A][0] = binding_unpack(KEY_SWIPE_RIGHT);
+  key_bindings[ACTION_B][0] = binding_unpack(KEY_SWIPE_RIGHT);
   CHECK(key_bindings[ACTION_A][0].key == key_bindings[ACTION_B][0].key,
-        "one diagonal swipe can be assigned to multiple GBA actions");
+        "one orthogonal swipe can be assigned to multiple GBA actions");
   keys_set_defaults(key_bindings);
 
   b = binding_unpack(KEY_S | (KEY_SHIFT << 8));
@@ -393,8 +776,21 @@ static void test_config(void)
   nspire_touchpad_swipe = 0;
   nspire_touchpad_deadzone = 5;
   nspire_touchpad_sensitivity = 6;
+  nspire_touchpad_glide_enabled = 1;
+  nspire_touchpad_glide_aspect_mode = GLIDE_ASPECT_EQUAL;
+  nspire_touchpad_glide_deadzone = 31;
+  nspire_touchpad_glide_invert_x = 1;
+  nspire_touchpad_glide_invert_y = 0;
+  nspire_touchpad_glide_smoothing = 1;
+  nspire_touchpad_glide_smooth_strength = GLIDE_SMOOTH_HIGH;
+  nspire_input_separation_mode = INPUT_SEPARATION_SMART;
+  nspire_input_slice_frames = 5;
+  nspire_touchpad_glide_masks[GLIDE_DIR_UP] = BUTTON_A | BUTTON_R;
+  nspire_touchpad_glide_masks[GLIDE_DIR_DOWN] = BUTTON_B | BUTTON_SELECT;
+  nspire_touchpad_glide_masks[GLIDE_DIR_LEFT] = BUTTON_LEFT | BUTTON_START;
+  nspire_touchpad_glide_masks[GLIDE_DIR_RIGHT] = BUTTON_DOWN | BUTTON_L;
   CHECK(nspire_config_save() == 0, "save");
-  CHECK(file_size(path) == 288, "gpsp_qol.cfg.tns is %ld bytes", file_size(path));
+  CHECK(file_size(path) == 388, "gpsp_qol.cfg.tns is %ld bytes", file_size(path));
   CHECK(file_size(old_path) < 0, "older builds' gpsp.cfg.tns left alone");
 
   keys_set_defaults(key_bindings);
@@ -408,6 +804,16 @@ static void test_config(void)
   nspire_touchpad_swipe = 1;
   nspire_touchpad_deadzone = 2;
   nspire_touchpad_sensitivity = 2;
+  nspire_touchpad_glide_enabled = 0;
+  nspire_touchpad_glide_aspect_mode = GLIDE_ASPECT_4_3;
+  nspire_touchpad_glide_deadzone = 8;
+  nspire_touchpad_glide_invert_x = 0;
+  nspire_touchpad_glide_invert_y = 1;
+  nspire_touchpad_glide_smoothing = 0;
+  nspire_touchpad_glide_smooth_strength = GLIDE_SMOOTH_MEDIUM;
+  nspire_input_separation_mode = INPUT_SEPARATION_OFF;
+  nspire_input_slice_frames = 2;
+  memset(nspire_touchpad_glide_masks, 0, sizeof(nspire_touchpad_glide_masks));
   CHECK(nspire_config_load() == 0, "load");
   CHECK(screen_scale == fullscreen && current_frameskip_type == manual_frameskip && frameskip_value == 3,
         "graphics settings %u %u %u", screen_scale, current_frameskip_type, frameskip_value);
@@ -415,6 +821,19 @@ static void test_config(void)
         nspire_cpu_speed == 2 && nspire_rom_buffer_size_choice == 12, "the new settings");
   CHECK(nspire_touchpad_swipe == 0 && nspire_touchpad_deadzone == 5 &&
         nspire_touchpad_sensitivity == 6, "swipe settings survive save/load");
+  CHECK(nspire_touchpad_glide_enabled == 1 && nspire_touchpad_glide_deadzone == 31 &&
+        nspire_touchpad_glide_invert_x == 1 && nspire_touchpad_glide_invert_y == 0 &&
+        nspire_touchpad_glide_aspect_mode == GLIDE_ASPECT_EQUAL &&
+        nspire_touchpad_glide_smoothing == 1 &&
+        nspire_touchpad_glide_smooth_strength == GLIDE_SMOOTH_HIGH &&
+        nspire_input_separation_mode == INPUT_SEPARATION_SMART &&
+        nspire_input_slice_frames == 5,
+        "glide settings survive save/load");
+  CHECK(nspire_touchpad_glide_masks[GLIDE_DIR_UP] == (BUTTON_A | BUTTON_R) &&
+        nspire_touchpad_glide_masks[GLIDE_DIR_DOWN] == (BUTTON_B | BUTTON_SELECT) &&
+        nspire_touchpad_glide_masks[GLIDE_DIR_LEFT] == (BUTTON_LEFT | BUTTON_START) &&
+        nspire_touchpad_glide_masks[GLIDE_DIR_RIGHT] == (BUTTON_DOWN | BUTTON_L),
+        "native glide button masks survive save/load");
   CHECK(key_bindings[ACTION_A][0].key == KEY_DEL && key_bindings[ACTION_A][1].key == KEY_7, "A's keys");
   CHECK(key_bindings[ACTION_SAVE_STATE][1].key == KEY_S && key_bindings[ACTION_SAVE_STATE][1].with == KEY_SHIFT,
         "combo kept");
@@ -457,6 +876,17 @@ static void test_config(void)
         nspire_fps_overlay == 1 && nspire_video_renderer_choice == 1, "old settings");
   CHECK(nspire_touchpad_swipe == 1 && nspire_touchpad_deadzone == 2 &&
         nspire_touchpad_sensitivity == 2, "legacy config gets safe swipe defaults");
+  CHECK(nspire_touchpad_glide_enabled == 0 && nspire_touchpad_glide_deadzone == 8 &&
+        nspire_touchpad_glide_invert_x == 0 && nspire_touchpad_glide_invert_y == 0 &&
+        nspire_touchpad_glide_aspect_mode == GLIDE_ASPECT_4_3 &&
+        nspire_touchpad_glide_smoothing == 0 &&
+        nspire_touchpad_glide_smooth_strength == GLIDE_SMOOTH_MEDIUM &&
+        nspire_input_separation_mode == INPUT_SEPARATION_OFF &&
+        nspire_input_slice_frames == 2,
+        "legacy config gets safe glide defaults");
+  CHECK(!nspire_touchpad_glide_masks[GLIDE_DIR_UP] && !nspire_touchpad_glide_masks[GLIDE_DIR_DOWN] &&
+        !nspire_touchpad_glide_masks[GLIDE_DIR_LEFT] && !nspire_touchpad_glide_masks[GLIDE_DIR_RIGHT],
+        "legacy config leaves all glide maps empty");
   CHECK(key_bindings[ACTION_UP][1].key == KEY_SWIPE_UP &&
         key_bindings[ACTION_RIGHT][1].key == KEY_SWIPE_RIGHT,
         "legacy config gains swipe defaults without replacing primary keys");
@@ -470,7 +900,7 @@ static void test_config(void)
    * aren't in it, so whatever was set stays (main() starts from defaults).
    * Saving writes this build's own file and leaves the old one alone. */
   CHECK(nspire_config_save() == 0, "save after the old file");
-  CHECK(file_size(path) == 288 && file_size(old_path) == 148, "files %ld %ld", file_size(path),
+  CHECK(file_size(path) == 388 && file_size(old_path) == 148, "files %ld %ld", file_size(path),
         file_size(old_path));
 
   /* A game's own settings. */
@@ -484,9 +914,17 @@ static void test_config(void)
   nspire_settings_for = 1;
   nspire_config_settings_for_changed();
   screen_scale = unscaled;   /* the game's own */
+  nspire_touchpad_glide_enabled = 0;
+  nspire_touchpad_glide_aspect_mode = GLIDE_ASPECT_EQUAL;
+  nspire_touchpad_glide_deadzone = 12;
+  nspire_touchpad_glide_smoothing = 1;
+  nspire_touchpad_glide_smooth_strength = GLIDE_SMOOTH_LOW;
+  nspire_input_separation_mode = INPUT_SEPARATION_ALL;
+  nspire_input_slice_frames = 4;
   nspire_keys_for = 1;
   nspire_config_keys_for_changed();
   key_bindings[ACTION_B][0] = binding_unpack(KEY_9);
+  nspire_touchpad_glide_masks[GLIDE_DIR_LEFT] = BUTTON_A | BUTTON_SELECT;
   CHECK(nspire_config_save() == 0, "save with a game open");
   CHECK(file_size(game_cfg) > 0, "game file written");
   nspire_config_close_game();
@@ -498,6 +936,14 @@ static void test_config(void)
   nspire_config_open_game(rom);
   CHECK(nspire_settings_for == 1 && nspire_keys_for == 1, "own settings found");
   CHECK(screen_scale == unscaled && key_bindings[ACTION_B][0].key == KEY_9, "own values used");
+  CHECK(nspire_touchpad_glide_enabled == 0 && nspire_touchpad_glide_deadzone == 12 &&
+        nspire_touchpad_glide_aspect_mode == GLIDE_ASPECT_EQUAL &&
+        nspire_touchpad_glide_smoothing == 1 &&
+        nspire_touchpad_glide_smooth_strength == GLIDE_SMOOTH_LOW &&
+        nspire_input_separation_mode == INPUT_SEPARATION_ALL &&
+        nspire_input_slice_frames == 4 &&
+        nspire_touchpad_glide_masks[GLIDE_DIR_LEFT] == (BUTTON_A | BUTTON_SELECT),
+        "game profile restores Glide and input-sharing settings");
   frameskip_value = 7;   /* a change while the game has its own settings */
   nspire_config_close_game();
   CHECK(frameskip_value == 4, "all games' frameskip untouched: %u", frameskip_value);
@@ -545,7 +991,7 @@ static int file_contains(const char *path, const char *text)
 static void test_config_versions(void)
 {
   char path[600], old_path[600], rom[600], game_cfg[600];
-  u32 o[72];
+  u32 o[97];
   FILE *f;
 
   snprintf(main_path, sizeof(main_path), "%s", dir);
@@ -574,6 +1020,27 @@ static void test_config_versions(void)
         key_bindings[ACTION_BRIGHTER][1].with == KEY_SHIFT && key_bindings[ACTION_DIMMER][0].key == KEY_7,
         "brightness keys kept");
   CHECK(key_bindings[ACTION_RESTART][0].key == 0 && key_bindings[ACTION_A][0].key == KEY_DEL, "others kept");
+
+  /* A 340-byte settings file from the immediately previous build has combo
+   * maps but no Glide fields; it must remain readable with Glide defaults. */
+  f = fopen(path, "rb");
+  CHECK(f && fread(o, 4, 97, f) == 97, "read current settings before truncating to the old layout");
+  if (f)
+    fclose(f);
+  write_words(path, o, 85);
+  nspire_touchpad_glide_enabled = 1;
+  nspire_touchpad_glide_aspect_mode = GLIDE_ASPECT_EQUAL;
+  nspire_touchpad_glide_deadzone = 75;
+  nspire_touchpad_glide_invert_x = nspire_touchpad_glide_invert_y = 1;
+  CHECK(nspire_config_load() == 0 && nspire_touchpad_glide_enabled == 0 &&
+        nspire_touchpad_glide_deadzone == 8 && !nspire_touchpad_glide_invert_x &&
+        !nspire_touchpad_glide_invert_y &&
+        nspire_touchpad_glide_aspect_mode == GLIDE_ASPECT_4_3 &&
+        nspire_touchpad_glide_smoothing == 0 &&
+        nspire_touchpad_glide_smooth_strength == GLIDE_SMOOTH_MEDIUM &&
+        nspire_input_separation_mode == INPUT_SEPARATION_OFF &&
+        nspire_input_slice_frames == 2,
+        "previous 340-byte configs load with safe Glide defaults");
 
   /* The first QoL build's file: its unscaled picture becomes the 320x214
    * one, its CPU speeds (normal, 432, 456, 480) move to today's list, and
@@ -607,9 +1074,9 @@ static void test_config_versions(void)
   write_words(path, o, 72);
   nspire_config_load();
   CHECK(nspire_cpu_speed == 5, "456 MHz is speed %u now", nspire_cpu_speed);
-  CHECK(nspire_config_save() == 0 && file_size(path) == 288, "saved as this build's");
+  CHECK(nspire_config_save() == 0 && file_size(path) == 388, "saved as this build's");
   f = fopen(path, "rb");
-  CHECK(f && fread(o, 4, 72, f) == 72, "read back");
+  CHECK(f && fread(o, 4, 97, f) == 97, "read back");
   if (f)
     fclose(f);
   CHECK(o[37] == 0x334C4F51u && o[61] == 5 && o[0] == scaled_raw && o[66] == 1,
@@ -617,6 +1084,33 @@ static void test_config_versions(void)
   CHECK(o[67] == 0x31505753u && o[68] == nspire_touchpad_swipe &&
         o[69] == nspire_touchpad_deadzone && o[70] == nspire_touchpad_sensitivity,
         "swipe options use reserved config words");
+  CHECK(o[85] == 0x33444C47u && o[86] == 0 && o[87] == 8 &&
+        o[90] == 0 && o[91] == 0 && o[92] == GLIDE_ASPECT_4_3 &&
+        o[93] == 0 && o[94] == GLIDE_SMOOTH_MEDIUM &&
+        o[95] == INPUT_SEPARATION_OFF && o[96] == 2,
+        "GLD3 glide and input options use the appended config words");
+
+  /* GLD2 preserves aspect settings and gives the new controls safe defaults. */
+  o[85] = 0x32444C47u;
+  write_words(path, o, 93);
+  nspire_touchpad_glide_smoothing = 1;
+  nspire_input_separation_mode = INPUT_SEPARATION_ALL;
+  nspire_input_slice_frames = 6;
+  CHECK(nspire_config_load() == 0 &&
+        nspire_touchpad_glide_aspect_mode == GLIDE_ASPECT_4_3 &&
+        nspire_touchpad_glide_smoothing == 0 &&
+        nspire_touchpad_glide_smooth_strength == GLIDE_SMOOTH_MEDIUM &&
+        nspire_input_separation_mode == INPUT_SEPARATION_OFF &&
+        nspire_input_slice_frames == 2,
+        "GLD2 settings migrate with defaults for smoothing and multiplexing");
+
+  /* GLD1 had a raw 20 px deadzone and no aspect mode; migrate both safely. */
+  o[85] = 0x31444C47u;
+  o[87] = 20;
+  write_words(path, o, 92);
+  CHECK(nspire_config_load() == 0 && nspire_touchpad_glide_deadzone == 8 &&
+        nspire_touchpad_glide_aspect_mode == GLIDE_ASPECT_4_3,
+        "GLD1 raw deadzone migrates to normalized percent and 4:3 mode");
 
   /* A game's own settings from the first QoL build (no version line). */
   snprintf(rom, sizeof(rom), "%s/Old.gba.tns", dir);
@@ -629,7 +1123,7 @@ static void test_config_versions(void)
   CHECK(screen_scale == scaled_raw && nspire_cpu_speed == 7 && frameskip_value == 6,
         "game file: scale %u cpu %u frameskip %u", screen_scale, nspire_cpu_speed, frameskip_value);
   nspire_config_close_game();
-  CHECK(file_contains(game_cfg, "version=5") && file_contains(game_cfg, "cpu_speed=7"), "rewritten");
+  CHECK(file_contains(game_cfg, "version=10") && file_contains(game_cfg, "cpu_speed=7"), "rewritten");
   nspire_config_open_game(rom);
   CHECK(nspire_cpu_speed == 7 && screen_scale == scaled_raw, "a version 3 file is read as it is");
   screen_scale = unscaled;
@@ -653,7 +1147,7 @@ static void test_settings_in_program(void)
 {
   char program[600], copy[600], beside[600];
   long bare, stored;
-  u8 data[300];
+  u8 data[400];
   FILE *f;
   int i;
 
@@ -673,14 +1167,14 @@ static void test_settings_in_program(void)
   CHECK(nspire_config_save() == 0, "save");
   stored = file_size(program);
   CHECK(stored == bare + SELFSTORE_SIZE + 16, "the program file grew by its settings area: %ld", stored);
-  CHECK(selfstore_read(program, data, sizeof(data)) == 288, "288 bytes stored in it");
+  CHECK(selfstore_read(program, data, sizeof(data)) == 388, "388 bytes stored in it");
   f = fopen(program, "rb");
   for (i = 0; f && i < 5000 && fgetc(f) == (i & 0xFF); i++)
     ;
   if (f)
     fclose(f);
   CHECK(i == 5000, "the program's own bytes untouched (%d)", i);
-  CHECK(file_size(copy) == 288, "and the copy in the saves folder");
+  CHECK(file_size(copy) == 388, "and the copy in the saves folder");
 
   /* From the program file first. */
   remove(copy);
@@ -780,7 +1274,7 @@ static void test_slot_keys(void)
   nspire_config_close_game();
   CHECK(key_bindings[ACTION_UP][1].key == 0 && key_bindings[ACTION_RIGHT][1].key == 0,
         "legacy game's defaults do not overwrite the all-games map");
-  CHECK(file_contains(game_cfg, "version=5"), "the game file is version 5 now");
+  CHECK(file_contains(game_cfg, "version=10"), "the game file is version 10 now");
   remove(game_cfg);
   nspire_compress_saves = 1;
   remove(path);
@@ -926,6 +1420,12 @@ int main(int argc, char **argv)
   test_keys();
   printf("touchpad swipe pipeline\n");
   test_swipe_input_pipeline();
+  printf("touchpad glide pipeline\n");
+  test_glide_input_pipeline();
+  printf("glide smoothing\n");
+  test_glide_smoothing();
+  printf("input separation scheduler\n");
+  test_input_separation_scheduler();
   printf("settings files\n");
   test_config();
   test_config_versions();
