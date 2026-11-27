@@ -160,6 +160,41 @@ extern unsigned nspire_touchpad_deadzone;
 extern unsigned nspire_touchpad_sensitivity;
 extern unsigned nspire_touchpad_diagonal_weight;
 
+/* Touchpad Glide is independent of the existing origin-based swipe mode.
+ * Its four masks use the native BUTTON_* bits from input.h, not ACTION_*'s
+ * ordinal bits. */
+enum nspire_glide_direction
+{
+  GLIDE_DIR_UP,
+  GLIDE_DIR_DOWN,
+  GLIDE_DIR_LEFT,
+  GLIDE_DIR_RIGHT
+};
+
+#define NUM_GLIDE_DIRS 4
+#define GLIDE_DEADZONE_MAX 100
+#define GLIDE_ASPECT_4_3 0
+#define GLIDE_ASPECT_EQUAL 1
+#define GLIDE_SMOOTH_LOW 0
+#define GLIDE_SMOOTH_MEDIUM 1
+#define GLIDE_SMOOTH_HIGH 2
+#define INPUT_SEPARATION_OFF 0
+#define INPUT_SEPARATION_SMART 1
+#define INPUT_SEPARATION_ALL 2
+
+extern unsigned nspire_touchpad_glide_enabled;
+extern unsigned nspire_touchpad_glide_aspect_mode;
+extern unsigned nspire_touchpad_glide_deadzone;
+extern unsigned nspire_touchpad_glide_invert_x;
+extern unsigned nspire_touchpad_glide_invert_y;
+extern unsigned nspire_touchpad_glide_smoothing;
+extern unsigned nspire_touchpad_glide_smooth_strength;
+extern unsigned short nspire_touchpad_glide_masks[NUM_GLIDE_DIRS];
+extern const char *const glide_dir_names[NUM_GLIDE_DIRS];
+extern const unsigned short touchpad_glide_button_bits[NUM_GBA_ACTIONS];
+extern unsigned nspire_input_separation_mode;
+extern unsigned nspire_input_slice_frames;
+
 unsigned touchpad_swipe_direction_mask(int dx, int dy, unsigned width,
                                        unsigned height, unsigned deadzone_percent,
                                        unsigned sensitivity_percent);

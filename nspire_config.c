@@ -7,7 +7,10 @@
  * words 72-84 store "CMB1" followed by the 4 orthogonal touchpad swipe
  * multi-action masks (packed two per word in 73-74) and the 8 custom
  * calculator/swipe multi-control combo slots (words 77-84: low 16 bits =
- * binding_pack(trigger), high 16 bits = action_mask). */
+ * binding_pack(trigger), high 16 bits = action_mask). Words 85-91 store the
+ * optional "GLD1" relative-glide settings and four native GBA button masks.
+ * GLD2 adds aspect weighting at word 92. Current GLD3 adds smoothing and
+ * input-separation options at words 93-96. */
 
 #include "common.h"
 #include "gui.h"
@@ -25,14 +28,21 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define CONFIG_WORDS 85
+#define CONFIG_WORDS 97
+#define GLIDE_V2_WORDS 93
+#define GLIDE_V1_WORDS 92
+#define PREVIOUS_CONFIG_WORDS 85
+#define COMBO_CONFIG_WORDS 85
 #define LEGACY_SWIPE_WORDS 72
 #define QOL_MAGIC  0x334C4F51u   /* "QOL3" */
 #define QOL2_MAGIC 0x324C4F51u   /* "QOL2", before word 66 and the slot keys */
 #define QOL1_MAGIC 0x314C4F51u   /* "QOL1", the first QoL build's */
-#define GAME_FILE_VERSION 7
+#define GAME_FILE_VERSION 10
 #define SWIPE_CONFIG_MAGIC 0x31505753u /* "SWP1" */
 #define COMBO_CONFIG_MAGIC 0x31424D43u /* "CMB1" */
+#define GLIDE_V1_MAGIC 0x31444C47u /* "GLD1" */
+#define GLIDE_V2_MAGIC 0x32444C47u /* "GLD2" */
+#define GLIDE_CONFIG_MAGIC 0x33444C47u /* "GLD3" */
 /* Actions before brightness up/down, in words 38-57. */
 #define FIRST_ACTIONS 20
 /* Top byte of word 26: gpSP's newer frameskip encoding (auto/manual/off). */
@@ -81,6 +91,15 @@ static const struct
   { "swipe_deadzone", &nspire_touchpad_deadzone, SWIPE_DEADZONE_CHOICES },
   { "swipe_sensitivity", &nspire_touchpad_sensitivity, SWIPE_SENSITIVITY_CHOICES },
   { "swipe_diag_weight", &nspire_touchpad_diagonal_weight, 2 },
+  { "touchpad_glide_enabled", &nspire_touchpad_glide_enabled, 2 },
+  { "touchpad_glide_aspect_mode", &nspire_touchpad_glide_aspect_mode, 2 },
+  { "touchpad_glide_deadzone", &nspire_touchpad_glide_deadzone, GLIDE_DEADZONE_MAX + 1 },
+  { "touchpad_glide_invert_x", &nspire_touchpad_glide_invert_x, 2 },
+  { "touchpad_glide_invert_y", &nspire_touchpad_glide_invert_y, 2 },
+  { "touchpad_glide_smoothing", &nspire_touchpad_glide_smoothing, 2 },
+  { "touchpad_glide_smooth_strength", &nspire_touchpad_glide_smooth_strength, 3 },
+  { "input_separation_mode", &nspire_input_separation_mode, 3 },
+  { "input_slice_frames", &nspire_input_slice_frames, 7 },
 };
 
 #define NUM_SETTINGS (int)(sizeof(settings) / sizeof(settings[0]))
@@ -98,6 +117,11 @@ static const char *const swipe_mask_ids[NUM_SWIPE_DIRS] =
   "up", "down", "left", "right"
 };
 
+static const char *const glide_mask_ids[NUM_GLIDE_DIRS] =
+{
+  "up", "down", "left", "right"
+};
+
 /* The first QoL build's CPU speeds (normal, 432, 456, 480 MHz) in today's
  * list (nspire_clock.h). */
 static u32 cpu_speed_from_qol1(u32 old)
@@ -110,6 +134,7 @@ static u32 cpu_speed_from_qol1(u32 old)
 static u32 global_values[NUM_SETTINGS];
 static key_binding global_keys[NUM_ACTIONS][KEY_SLOTS];
 static unsigned short global_swipe_masks[NUM_SWIPE_DIRS];
+static unsigned short global_glide_masks[NUM_GLIDE_DIRS];
 static combo_binding global_combos[NUM_COMBO_SLOTS];
 static int game_open, own_settings, own_keys;
 /* The open game's file, kept from when it opened: by the time it closes,
@@ -206,17 +231,34 @@ s32 nspire_config_load(void)
   int qol = 0;   /* 0: older, 1: QOL1, 2: QOL2, 3: QOL3 layout */
   int swipe_config_present;
   int combo_config_present;
+  int glide_config_present, glide_v2_present, glide_v1_present;
 
   memset(o, 0, sizeof(o));
   size = read_settings(o);
   /* Sizes gpSP's builds wrote (92 = keys, 96 = +BIOS, 112 = +frameskip,
    * 124 = +emulator options, 128 = +ROM buffer, 132 = +LCD cache, 136 = +FPS,
    * 140 = +blending, 144 = +dynarec SMC, 148 = +renderer, 152 = older
-   * renderer, 288 = SWP1, 340 = CMB1). */
+   * renderer, 288 = SWP1, 340 = CMB1, 368 = GLD1, 372 = GLD2,
+   * 388 = GLD3). */
   if (!(size == 92 || (size >= 96 && size <= 152 && size % 4 == 0) ||
-        size == LEGACY_SWIPE_WORDS * 4 || size == CONFIG_WORDS * 4))
+        size == LEGACY_SWIPE_WORDS * 4 ||
+        size == PREVIOUS_CONFIG_WORDS * 4 || size == GLIDE_V1_WORDS * 4 ||
+        size == GLIDE_V2_WORDS * 4 || size == CONFIG_WORDS * 4))
     return -1;
   words = (u32)size / 4;
+
+  /* Older files never contain glide options: keep the feature safely off. */
+  nspire_touchpad_glide_enabled = 0;
+  nspire_touchpad_glide_aspect_mode = GLIDE_ASPECT_4_3;
+  nspire_touchpad_glide_deadzone = 8;
+  nspire_touchpad_glide_invert_x = 0;
+  nspire_touchpad_glide_invert_y = 0;
+  nspire_touchpad_glide_smoothing = 0;
+  nspire_touchpad_glide_smooth_strength = GLIDE_SMOOTH_MEDIUM;
+  nspire_input_separation_mode = INPUT_SEPARATION_OFF;
+  nspire_input_slice_frames = 2;
+  memset(nspire_touchpad_glide_masks, 0, sizeof(nspire_touchpad_glide_masks));
+
   swipe_config_present = words >= 71 && o[67] == SWIPE_CONFIG_MAGIC;
   if (swipe_config_present)
   {
@@ -319,7 +361,7 @@ s32 nspire_config_load(void)
   if (!swipe_config_present)
     keys_add_swipe_defaults_if_free(key_bindings);
 
-  combo_config_present = words >= CONFIG_WORDS && o[72] == COMBO_CONFIG_MAGIC;
+  combo_config_present = words >= COMBO_CONFIG_WORDS && o[72] == COMBO_CONFIG_MAGIC;
   if (combo_config_present)
   {
     for (i = 0; i < NUM_SWIPE_DIRS / 2; i++)
@@ -336,6 +378,44 @@ s32 nspire_config_load(void)
   else
   {
     combos_set_defaults(swipe_action_masks, combo_bindings);
+  }
+
+  glide_config_present = words >= CONFIG_WORDS && o[85] == GLIDE_CONFIG_MAGIC;
+  glide_v2_present = words >= GLIDE_V2_WORDS && o[85] == GLIDE_V2_MAGIC;
+  glide_v1_present = words >= GLIDE_V1_WORDS && o[85] == GLIDE_V1_MAGIC;
+  if (glide_config_present || glide_v2_present || glide_v1_present)
+  {
+    nspire_touchpad_glide_enabled = o[86] % 2u;
+    nspire_touchpad_glide_invert_x = o[88] & 1u;
+    nspire_touchpad_glide_invert_y = (o[88] >> 1) & 1u;
+    if (glide_config_present || glide_v2_present)
+    {
+      nspire_touchpad_glide_deadzone = o[87] % (GLIDE_DEADZONE_MAX + 1u);
+      nspire_touchpad_glide_aspect_mode = o[92] % 2u;
+    }
+    else
+    {
+      /* GLD1 stored raw coordinate units; convert against the historical
+       * 240 px short side so its 20 px default remains close to 8%. */
+      u32 old_raw_deadzone = o[87] % (GLIDE_DEADZONE_MAX + 1u);
+      nspire_touchpad_glide_deadzone = (old_raw_deadzone * 100u + 120u) / 240u;
+      if (nspire_touchpad_glide_deadzone > GLIDE_DEADZONE_MAX)
+        nspire_touchpad_glide_deadzone = GLIDE_DEADZONE_MAX;
+      nspire_touchpad_glide_aspect_mode = GLIDE_ASPECT_4_3;
+    }
+    if (glide_config_present)
+    {
+      nspire_touchpad_glide_smoothing = o[93] % 2u;
+      nspire_touchpad_glide_smooth_strength = o[94] % 3u;
+      nspire_input_separation_mode = o[95] % 3u;
+      nspire_input_slice_frames = o[96];
+      if (nspire_input_slice_frames < 1u || nspire_input_slice_frames > 6u)
+        nspire_input_slice_frames = 2;
+    }
+    nspire_touchpad_glide_masks[GLIDE_DIR_UP] = (unsigned short)(o[90] & 0x3FFu);
+    nspire_touchpad_glide_masks[GLIDE_DIR_DOWN] = (unsigned short)((o[90] >> 16) & 0x3FFu);
+    nspire_touchpad_glide_masks[GLIDE_DIR_LEFT] = (unsigned short)(o[91] & 0x3FFu);
+    nspire_touchpad_glide_masks[GLIDE_DIR_RIGHT] = (unsigned short)((o[91] >> 16) & 0x3FFu);
   }
 
   clamp_rom_buffer_size();
@@ -399,6 +479,23 @@ static int write_global_file(void)
     o[77 + i] = (binding_pack(combo_bindings[i].trigger) & 0xFFFFu) |
                 (((u32)(combo_bindings[i].action_mask & 0x3FFu)) << 16);
 
+  o[85] = GLIDE_CONFIG_MAGIC;
+  o[86] = nspire_touchpad_glide_enabled % 2u;
+  o[87] = nspire_touchpad_glide_deadzone % (GLIDE_DEADZONE_MAX + 1u);
+  o[88] = (nspire_touchpad_glide_invert_x % 2u) |
+          ((nspire_touchpad_glide_invert_y % 2u) << 1);
+  o[89] = 0; /* reserved; GLD1 used this word for the removed hold timer */
+  o[90] = ((u32)(nspire_touchpad_glide_masks[GLIDE_DIR_UP] & 0x3FFu)) |
+          (((u32)(nspire_touchpad_glide_masks[GLIDE_DIR_DOWN] & 0x3FFu)) << 16);
+  o[91] = ((u32)(nspire_touchpad_glide_masks[GLIDE_DIR_LEFT] & 0x3FFu)) |
+          (((u32)(nspire_touchpad_glide_masks[GLIDE_DIR_RIGHT] & 0x3FFu)) << 16);
+  o[92] = nspire_touchpad_glide_aspect_mode % 2u;
+  o[93] = nspire_touchpad_glide_smoothing % 2u;
+  o[94] = nspire_touchpad_glide_smooth_strength % 3u;
+  o[95] = nspire_input_separation_mode % 3u;
+  o[96] = nspire_input_slice_frames >= 1u && nspire_input_slice_frames <= 6u ?
+          nspire_input_slice_frames : 2u;
+
   /* The copy in the saves folder, then the program file. */
   nspire_save_dir_make();
   nspire_save_file(path, sizeof(path), CONFIG_FILE);
@@ -456,6 +553,9 @@ static void write_game_file(void)
     for (i = 0; i < NUM_SWIPE_DIRS; i++)
       fprintf(f, "swipe_mask_%s=%u\n", swipe_mask_ids[i],
               (unsigned)(swipe_action_masks[i] & 0x3FFu));
+    for (i = 0; i < NUM_GLIDE_DIRS; i++)
+      fprintf(f, "glide_mask_%s=%u\n", glide_mask_ids[i],
+              (unsigned)(nspire_touchpad_glide_masks[i] & 0x3FFu));
     for (i = 0; i < NUM_COMBO_SLOTS; i++)
     {
       fprintf(f, "combo_key_%d=%u\n", i + 1,
@@ -474,6 +574,7 @@ void nspire_config_open_game(const char *rom_path)
   unsigned char in_file[NUM_SETTINGS];
   key_binding keys[NUM_ACTIONS][KEY_SLOTS];
   unsigned short swipes[NUM_SWIPE_DIRS];
+  unsigned short glides[NUM_GLIDE_DIRS];
   combo_binding combos[NUM_COMBO_SLOTS];
   int has_settings = 0, has_keys = 0, version = 1, i;
   FILE *f;
@@ -482,10 +583,12 @@ void nspire_config_open_game(const char *rom_path)
   capture(global_values);
   memcpy(global_keys, key_bindings, sizeof(global_keys));
   memcpy(global_swipe_masks, swipe_action_masks, sizeof(global_swipe_masks));
+  memcpy(global_glide_masks, nspire_touchpad_glide_masks, sizeof(global_glide_masks));
   memcpy(global_combos, combo_bindings, sizeof(global_combos));
   memcpy(values, global_values, sizeof(values));
   memcpy(keys, key_bindings, sizeof(keys));
   memcpy(swipes, swipe_action_masks, sizeof(swipes));
+  memcpy(glides, nspire_touchpad_glide_masks, sizeof(glides));
   memcpy(combos, combo_bindings, sizeof(combos));
   memset(in_file, 0, sizeof(in_file));
   game_open = 1;
@@ -515,6 +618,12 @@ void nspire_config_open_game(const char *rom_path)
           if (!strcmp(line + 11, swipe_mask_ids[i]))
             swipes[i] = (unsigned short)(number & 0x3FFu);
       }
+      else if (!strncmp(line, "glide_mask_", 11))
+      {
+        for (i = 0; i < NUM_GLIDE_DIRS; i++)
+          if (!strcmp(line + 11, glide_mask_ids[i]))
+            glides[i] = (unsigned short)(number & 0x3FFu);
+      }
       else if (!strncmp(line, "combo_key_", 10))
       {
         int idx = atoi(line + 10) - 1;
@@ -541,6 +650,8 @@ void nspire_config_open_game(const char *rom_path)
           if (!strcmp(line, settings[i].name))
           {
             values[i] = (u32)number % settings[i].count;
+            if (settings[i].value == &nspire_input_slice_frames && !values[i])
+              values[i] = 2;
             in_file[i] = 1;
           }
     }
@@ -575,6 +686,7 @@ void nspire_config_open_game(const char *rom_path)
       keys_add_swipe_defaults_if_free(keys);
     memcpy(key_bindings, keys, sizeof(keys));
     memcpy(swipe_action_masks, swipes, sizeof(swipes));
+    memcpy(nspire_touchpad_glide_masks, glides, sizeof(glides));
     memcpy(combo_bindings, combos, sizeof(combos));
   }
   /* A raised CPU speed froze this game last time (nspire_clock.c). */
@@ -603,12 +715,14 @@ void nspire_config_close_game(void)
   {
     memcpy(key_bindings, global_keys, sizeof(global_keys));
     memcpy(swipe_action_masks, global_swipe_masks, sizeof(global_swipe_masks));
+    memcpy(nspire_touchpad_glide_masks, global_glide_masks, sizeof(global_glide_masks));
     memcpy(combo_bindings, global_combos, sizeof(global_combos));
   }
   else
   {
     memcpy(global_keys, key_bindings, sizeof(global_keys));
     memcpy(global_swipe_masks, swipe_action_masks, sizeof(global_swipe_masks));
+    memcpy(global_glide_masks, nspire_touchpad_glide_masks, sizeof(global_glide_masks));
     memcpy(global_combos, combo_bindings, sizeof(global_combos));
   }
   game_open = own_settings = own_keys = 0;
@@ -649,6 +763,7 @@ void nspire_config_keys_for_changed(void)
   {
     memcpy(global_keys, key_bindings, sizeof(global_keys));
     memcpy(global_swipe_masks, swipe_action_masks, sizeof(global_swipe_masks));
+    memcpy(global_glide_masks, nspire_touchpad_glide_masks, sizeof(global_glide_masks));
     memcpy(global_combos, combo_bindings, sizeof(global_combos));
     own_keys = 1;
   }
@@ -657,6 +772,7 @@ void nspire_config_keys_for_changed(void)
     own_keys = 0;
     memcpy(key_bindings, global_keys, sizeof(global_keys));
     memcpy(swipe_action_masks, global_swipe_masks, sizeof(global_swipe_masks));
+    memcpy(nspire_touchpad_glide_masks, global_glide_masks, sizeof(global_glide_masks));
     memcpy(combo_bindings, global_combos, sizeof(global_combos));
   }
 }
@@ -667,6 +783,7 @@ s32 nspire_config_save(void)
   u32 live[NUM_SETTINGS];
   key_binding live_keys[NUM_ACTIONS][KEY_SLOTS];
   unsigned short live_swipes[NUM_SWIPE_DIRS];
+  unsigned short live_glides[NUM_GLIDE_DIRS];
   combo_binding live_combos[NUM_COMBO_SLOTS];
   s32 result;
 
@@ -677,21 +794,25 @@ s32 nspire_config_save(void)
   {
     memcpy(global_keys, key_bindings, sizeof(global_keys));
     memcpy(global_swipe_masks, swipe_action_masks, sizeof(global_swipe_masks));
+    memcpy(global_glide_masks, nspire_touchpad_glide_masks, sizeof(global_glide_masks));
     memcpy(global_combos, combo_bindings, sizeof(global_combos));
   }
 
   capture(live);
   memcpy(live_keys, key_bindings, sizeof(live_keys));
   memcpy(live_swipes, swipe_action_masks, sizeof(live_swipes));
+  memcpy(live_glides, nspire_touchpad_glide_masks, sizeof(live_glides));
   memcpy(live_combos, combo_bindings, sizeof(live_combos));
   apply(global_values);
   memcpy(key_bindings, global_keys, sizeof(global_keys));
   memcpy(swipe_action_masks, global_swipe_masks, sizeof(global_swipe_masks));
+  memcpy(nspire_touchpad_glide_masks, global_glide_masks, sizeof(global_glide_masks));
   memcpy(combo_bindings, global_combos, sizeof(global_combos));
   result = write_global_file();
   apply(live);
   memcpy(key_bindings, live_keys, sizeof(live_keys));
   memcpy(swipe_action_masks, live_swipes, sizeof(live_swipes));
+  memcpy(nspire_touchpad_glide_masks, live_glides, sizeof(live_glides));
   memcpy(combo_bindings, live_combos, sizeof(live_combos));
 
   write_game_file();

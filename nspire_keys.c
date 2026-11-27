@@ -42,6 +42,19 @@ unsigned nspire_touchpad_deadzone = 2;
 unsigned nspire_touchpad_sensitivity = 2;
 unsigned nspire_touchpad_diagonal_weight = 1;
 
+/* Relative Touchpad Glide starts disabled so existing touchpad behavior is
+ * unchanged until the user turns it on. */
+unsigned nspire_touchpad_glide_enabled = 0;
+unsigned nspire_touchpad_glide_aspect_mode = GLIDE_ASPECT_4_3;
+unsigned nspire_touchpad_glide_deadzone = 8;
+unsigned nspire_touchpad_glide_invert_x = 0;
+unsigned nspire_touchpad_glide_invert_y = 0;
+unsigned nspire_touchpad_glide_smoothing = 0;
+unsigned nspire_touchpad_glide_smooth_strength = GLIDE_SMOOTH_MEDIUM;
+unsigned short nspire_touchpad_glide_masks[NUM_GLIDE_DIRS];
+unsigned nspire_input_separation_mode = INPUT_SEPARATION_OFF;
+unsigned nspire_input_slice_frames = 2;
+
 const char *const action_names[NUM_ACTIONS] =
 {
   "D-pad up", "D-pad down", "D-pad left", "D-pad right",
@@ -57,6 +70,14 @@ const char *const swipe_dir_names[NUM_SWIPE_DIRS] =
   "Swipe down",
   "Swipe left",
   "Swipe right"
+};
+
+const char *const glide_dir_names[NUM_GLIDE_DIRS] =
+{
+  "Glide Up",
+  "Glide Down",
+  "Glide Left",
+  "Glide Right"
 };
 
 static const char *const short_gba_names[NUM_GBA_ACTIONS] =

@@ -791,7 +791,8 @@ typedef enum
   KEY_SELECTION_OPTION    = 0x10,
   KEY_BINDING_OPTION      = 0x20,  /* Nspire: an action's two key bindings */
   SWIPE_MULTI_OPTION      = 0x40,  /* Nspire: a swipe direction's multi-GBA mask */
-  COMBO_SLOT_OPTION       = 0x80   /* Nspire: a custom key/swipe -> multi-GBA mask */
+  COMBO_SLOT_OPTION       = 0x80,  /* Nspire: a custom key/swipe -> multi-GBA mask */
+  GLIDE_MULTI_OPTION      = 0x100  /* Nspire: a relative-glide multi-GBA mask */
 } menu_option_type_enum;
 
 struct _menu_type
@@ -887,6 +888,15 @@ typedef struct _menu_type menu_type;
   "Right col: Enter picks multiple GBA controls\n"                            \
   "to fire together. Works with other keys!",                                 \
   line_number, COMBO_SLOT_OPTION                                              \
+}
+
+/* Native-button mapping for one relative touchpad glide direction. */
+#define glide_multi_option(dir_index, line_number)                            \
+{                                                                             \
+  NULL, NULL, NULL, NULL, NULL, NULL, dir_index,                              \
+  "Enter opens the GBA multi-control checklist\n"                            \
+  "for this relative glide direction.",                                     \
+  line_number, GLIDE_MULTI_OPTION                                             \
 }
 
 /* The main menu's slot lines, and the last line of options on the screen
@@ -1197,6 +1207,75 @@ static void gui_edit_action_mask(const char *title, unsigned short *io_mask)
   }
   keys_wait_release();
 }
+
+/* The relative-glide masks use the native BUTTON_* bits, unlike swipe and
+ * key-combo masks, which use ACTION_* ordinal bits. */
+static void gui_edit_glide_mask(const char *title, unsigned short *io_mask)
+{
+  int cursor = 0;
+  const int total_rows = NUM_GBA_ACTIONS + 2;
+  int i;
+
+  keys_wait_release();
+  for (;;)
+  {
+    gui_action_type act;
+    char header[64];
+
+    clear_screen(COLOR_BG);
+    snprintf(header, sizeof(header), "%s controls", title);
+    print_string_pad(header, COLOR_ACTIVE_ITEM, COLOR_BG, 10, 10, 50);
+    print_string_pad("Enter/Left/Right: toggle   Del: clear   Menu/Esc: done",
+                     COLOR_HELP_TEXT, COLOR_BG, 10, 22, 52);
+
+    for (i = 0; i < NUM_GBA_ACTIONS; i++)
+    {
+      char line[64];
+      int checked = ((*io_mask & touchpad_glide_button_bits[i]) != 0);
+      u16 color = (cursor == i) ? COLOR_ACTIVE_ITEM : COLOR_INACTIVE_ITEM;
+      snprintf(line, sizeof(line), "%s [%c] %s",
+               (cursor == i) ? ">" : " ", checked ? 'X' : ' ', action_names[i]);
+      print_string_pad(line, color, COLOR_BG, 14, 40 + i * 12, 42);
+    }
+
+    print_string_pad(cursor == NUM_GBA_ACTIONS ? "> [Clear all controls]" : "  [Clear all controls]",
+                     cursor == NUM_GBA_ACTIONS ? COLOR_ACTIVE_ITEM : COLOR_INACTIVE_ITEM,
+                     COLOR_BG, 14, 40 + NUM_GBA_ACTIONS * 12 + 4, 42);
+    print_string_pad(cursor == NUM_GBA_ACTIONS + 1 ? "> [Done]" : "  [Done]",
+                     cursor == NUM_GBA_ACTIONS + 1 ? COLOR_ACTIVE_ITEM : COLOR_INACTIVE_ITEM,
+                     COLOR_BG, 14, 40 + (NUM_GBA_ACTIONS + 1) * 12 + 4, 42);
+
+    flip_screen();
+#ifdef NSPIRE_BUILD
+    update_at_vblank();
+#endif
+
+    act = get_gui_input();
+    if (act == CURSOR_UP)
+      cursor = (cursor - 1 + total_rows) % total_rows;
+    else if (act == CURSOR_DOWN)
+      cursor = (cursor + 1) % total_rows;
+    else if (act == CURSOR_SELECT || act == CURSOR_LEFT || act == CURSOR_RIGHT)
+    {
+      if (cursor < NUM_GBA_ACTIONS)
+        *io_mask ^= touchpad_glide_button_bits[cursor];
+      else if (cursor == NUM_GBA_ACTIONS)
+        *io_mask = 0;
+      else if (act == CURSOR_SELECT)
+        break;
+    }
+    else if (act == CURSOR_CLEAR)
+    {
+      if (cursor < NUM_GBA_ACTIONS)
+        *io_mask &= (unsigned short)~touchpad_glide_button_bits[cursor];
+      else
+        *io_mask = 0;
+    }
+    else if (act == CURSOR_BACK || act == CURSOR_EXIT)
+      break;
+  }
+  keys_wait_release();
+}
 #endif
 
 u32 menu(u16 *original_screen)
@@ -1229,6 +1308,21 @@ u32 menu(u16 *original_screen)
   char menu_status[80] = "";   /* what the last action did */
   u8 *settings_for_options[] = { "all games", "this game only" };
   u8 *touchpad_swipe_options[] = { "off", "on" };
+  u8 *glide_on_off_options[] = { (u8 *)"off", (u8 *)"on" };
+  u8 *glide_aspect_options[] = { (u8 *)"4:3 weighted", (u8 *)"equal (1:1)" };
+  u8 *glide_smooth_strength_options[] =
+    { (u8 *)"low", (u8 *)"medium", (u8 *)"high" };
+  u8 *input_separation_options[] =
+    { (u8 *)"off", (u8 *)"smart (chords)", (u8 *)"separate all" };
+  u8 *input_slice_frame_options[] =
+    { (u8 *)"1 frame", (u8 *)"2 frames", (u8 *)"3 frames",
+      (u8 *)"4 frames", (u8 *)"5 frames", (u8 *)"6 frames" };
+  u32 input_slice_frame_choice = 1;
+
+  void nspire_input_slice_frames_changed()
+  {
+    nspire_input_slice_frames = input_slice_frame_choice + 1u;
+  }
   u8 *swipe_deadzone_options[] = { "3%", "5%", "8%", "10%", "12%", "15%", "20%" };
   u8 *swipe_sensitivity_options[] = { "50%", "75%", "100%", "125%", "150%", "175%", "200%" };
   u8 *swipe_diag_weight_options[] = { "equal H+V (100/100)", "weighted 4:3 angle" };
@@ -1291,14 +1385,52 @@ u32 menu(u16 *original_screen)
      &nspire_touchpad_diagonal_weight, 2,
      "Weighted 4:3 angle: splits diagonal swipes into\n"
      "H and V inputs weighted by 4:3 pad travel.", 37),
+    string_selection_option(NULL, "Touchpad Glide", glide_on_off_options,
+     &nspire_touchpad_glide_enabled, 2,
+     "Off leaves the existing touchpad modes unchanged.\n"
+     "On maps latched relative finger movement.", 38),
+    string_selection_option(NULL, "Glide weighting", glide_aspect_options,
+     &nspire_touchpad_glide_aspect_mode, 2,
+     "4:3 matches physical pad angles. Equal treats both\n"
+     "normalized touchpad spans the same.", 39),
+    numeric_selection_option(NULL, "Glide deadzone",
+     &nspire_touchpad_glide_deadzone, GLIDE_DEADZONE_MAX + 1,
+     "Percent of the shorter weighted pad span; smaller\n"
+     "values are more sensitive. Default: 8.", 40),
+    string_selection_option(NULL, "Invert glide X", glide_on_off_options,
+     &nspire_touchpad_glide_invert_x, 2,
+     "Reverse left and right movement.", 41),
+    string_selection_option(NULL, "Invert glide Y", glide_on_off_options,
+     &nspire_touchpad_glide_invert_y, 2,
+     "Reverse up and down movement.", 42),
+    glide_multi_option(GLIDE_DIR_UP, 43),
+    glide_multi_option(GLIDE_DIR_DOWN, 44),
+    glide_multi_option(GLIDE_DIR_LEFT, 45),
+    glide_multi_option(GLIDE_DIR_RIGHT, 46),
+    string_selection_option(NULL, "Glide smoothing", glide_on_off_options,
+     &nspire_touchpad_glide_smoothing, 2,
+     "Filter glide angles and group pulses into short\n"
+     "holds. Off keeps the unsmoothed glide response.", 47),
+    string_selection_option(NULL, "Smoothing strength", glide_smooth_strength_options,
+     &nspire_touchpad_glide_smooth_strength, 3,
+     "Low is most responsive; High smooths more and\n"
+     "uses a longer direction hold.", 48),
+    string_selection_option(NULL, "Separate inputs", input_separation_options,
+     &nspire_input_separation_mode, 3,
+     "Smart keeps single buttons together and slices\n"
+     "multi-button chords. Separate All slices sources.", 49),
+    string_selection_option(nspire_input_slice_frames_changed, "Input slice frames",
+     input_slice_frame_options, &input_slice_frame_choice, 6,
+     "Frames to hold each source layer before advancing\n"
+     "to the next active input.", 50),
     string_selection_option(nspire_config_keys_for_changed, "Keys for",
      settings_for_options, &nspire_keys_for, 2,
      "All games, or this game only: the game keeps its\n"
-     "own keys, swipe combos, and macro slots.", 38),
+     "own keys, swipe combos, glide maps, and macros.", 51),
     action_option(menu_reset_keys, NULL, "Reset keys to defaults",
      "8 5 4 6, del A, var B, scratch L, doc R, shift\n"
-     "Start, ctrl Select, menu, F, L, S, Q, + and -.", 39),
-    submenu_option(NULL, "Back", "Return to the main menu.", 41)
+     "Start, ctrl Select, menu, F, L, S, Q, + and -.", 52),
+    submenu_option(NULL, "Back", "Return to the main menu.", 53)
   };
 
 
@@ -1521,6 +1653,8 @@ u32 menu(u16 *original_screen)
 
   void submenu_gamepad()
   {
+    input_slice_frame_choice = nspire_input_slice_frames >= 1u &&
+      nspire_input_slice_frames <= 6u ? nspire_input_slice_frames - 1u : 1u;
   }
 
   void submenu_analog()
@@ -2075,6 +2209,12 @@ u32 menu(u16 *original_screen)
          picked && key_column == 1 ? "[" : " ", mask_str,
          picked && key_column == 1 ? "]" : " ");
       }
+      else if(display_option->option_type & GLIDE_MULTI_OPTION)
+      {
+        u32 dir = display_option->num_options;
+        snprintf((char *)line_buffer, sizeof(line_buffer), "%s Controls ->",
+                 glide_dir_names[dir]);
+      }
       else
 #endif
       if(display_option->option_type & NUMBER_SELECTION_OPTION)
@@ -2211,6 +2351,12 @@ u32 menu(u16 *original_screen)
           gui_edit_action_mask(swipe_dir_names[dir], &swipe_action_masks[dir]);
           break;
         }
+        if(current_option->option_type & GLIDE_MULTI_OPTION)
+        {
+          u32 dir = current_option->num_options;
+          gui_edit_glide_mask(glide_dir_names[dir], &nspire_touchpad_glide_masks[dir]);
+          break;
+        }
         if(current_option->option_type & COMBO_SLOT_OPTION)
         {
           u32 slot = current_option->num_options;
@@ -2250,6 +2396,10 @@ u32 menu(u16 *original_screen)
         else if(current_option->option_type & SWIPE_MULTI_OPTION)
         {
           swipe_action_masks[current_option->num_options] = 0;
+        }
+        else if(current_option->option_type & GLIDE_MULTI_OPTION)
+        {
+          nspire_touchpad_glide_masks[current_option->num_options] = 0;
         }
         else if(current_option->option_type & COMBO_SLOT_OPTION)
         {

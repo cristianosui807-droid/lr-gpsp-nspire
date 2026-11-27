@@ -14,6 +14,7 @@
 #include "nspire_brightness.h"
 
 #include <os.h>
+#include <libndls.h>
 
 bool libretro_supports_bitmasks    = false;
 bool libretro_supports_ff_override = false;
@@ -66,12 +67,12 @@ static void trigger_key(u32 key)
 #define TOUCHPAD_KEYS_MASK 0xFF00FFFD
 #define TOUCHPAD_DEFAULT_WIDTH 320u
 #define TOUCHPAD_DEFAULT_HEIGHT 240u
+#define GLIDE_WEIGHT_ONE 4096u
 
 static u32 current_keys[NUM_KEY_WORDS];
 static u32 new_keys[NUM_KEY_WORDS];
 static unsigned touchpad_width = TOUCHPAD_DEFAULT_WIDTH;
 static unsigned touchpad_height = TOUCHPAD_DEFAULT_HEIGHT;
-static int touchpad_size_checked;
 static int swipe_contact_active;
 static unsigned short swipe_origin_x, swipe_origin_y;
 /* Raw (un-pulsed) swipe directions currently above the deadzone, used during
@@ -83,20 +84,339 @@ static unsigned swipe_x_accum, swipe_y_accum;
 /* Preserve edge-arrow navigation in menus while reserving those zones from
  * GBA gameplay input when swipe mode is enabled. */
 static unsigned current_touchpad_arrow;
+static int touchpad_available;
+static int touchpad_info_checked;
+static int glide_was_touching;
+static int glide_was_enabled;
+static int glide_anchor_x, glide_anchor_y;
+static int glide_latched_wx, glide_latched_wy;
+static int glide_smooth_vx, glide_smooth_vy;
+static int glide_hysteresis_x_active, glide_hysteresis_y_active;
+static unsigned glide_smoothing_mode;
+static int glide_smoothing_mode_known;
+static unsigned glide_accum_x, glide_accum_y;
+static unsigned glide_hold_remaining_x, glide_hold_remaining_y;
+static int glide_hold_direction_x, glide_hold_direction_y;
+static unsigned short glide_current_buttons[NUM_GLIDE_DIRS];
+static unsigned input_current_layer_idx, input_slice_frame_counter;
+static unsigned input_previous_separation_mode;
+
+/* The glide maps use the native bit positions already consumed by gba_buttons. */
+const unsigned short touchpad_glide_button_bits[NUM_GBA_ACTIONS] =
+{
+  BUTTON_UP, BUTTON_DOWN, BUTTON_LEFT, BUTTON_RIGHT,
+  BUTTON_A, BUTTON_B, BUTTON_L, BUTTON_R, BUTTON_START, BUTTON_SELECT
+};
+
+static void touchpad_initialize(void)
+{
+  if (!touchpad_info_checked)
+  {
+    if (is_touchpad)
+    {
+      touchpad_info_t *tp_info = touchpad_getinfo();
+      if (tp_info && tp_info->width && tp_info->height)
+      {
+        touchpad_width = tp_info->width;
+        touchpad_height = tp_info->height;
+        touchpad_available = 1;
+      }
+    }
+    /* Preserve the old 4:3 swipe fallback on devices without a raw touchpad. */
+    touchpad_info_checked = 1;
+  }
+}
+
+static void touchpad_glide_reset(void)
+{
+  glide_was_touching = 0;
+  glide_anchor_x = glide_anchor_y = 0;
+  glide_latched_wx = glide_latched_wy = 0;
+  glide_smooth_vx = glide_smooth_vy = 0;
+  glide_hysteresis_x_active = glide_hysteresis_y_active = 0;
+  glide_smoothing_mode_known = 0;
+  glide_accum_x = glide_accum_y = 0;
+  glide_hold_remaining_x = glide_hold_remaining_y = 0;
+  glide_hold_direction_x = glide_hold_direction_y = 0;
+  memset(glide_current_buttons, 0, sizeof(glide_current_buttons));
+}
+
+/* Integer square root used only after a movement crosses the deadzone. */
+static unsigned touchpad_glide_isqrt(unsigned value)
+{
+  unsigned result = 0;
+  unsigned bit = 1u << 30;
+
+  while (bit > value)
+    bit >>= 2;
+  while (bit)
+  {
+    if (value >= result + bit)
+    {
+      value -= result + bit;
+      result = (result >> 1) + bit;
+    }
+    else
+    {
+      result >>= 1;
+    }
+    bit >>= 2;
+  }
+  return result;
+}
+
+/* Digital buttons approximate an axis weight with a Q12 duty-cycle pulse. */
+static int touchpad_glide_axis_pulse(int weight, unsigned *accum)
+{
+  unsigned amount;
+  if (!weight)
+  {
+    *accum = 0;
+    return 0;
+  }
+  amount = (unsigned)(weight < 0 ? -weight : weight);
+  *accum += amount;
+  if (*accum >= GLIDE_WEIGHT_ONE)
+  {
+    *accum -= GLIDE_WEIGHT_ONE;
+    return 1;
+  }
+  return 0;
+}
+
+/* Smoothing groups fractional pulses into short, continuous button holds. */
+static int touchpad_glide_axis_held(int weight, unsigned *accum,
+                                    unsigned *hold_remaining,
+                                    int *hold_direction, unsigned hold_frames)
+{
+  unsigned threshold = GLIDE_WEIGHT_ONE * hold_frames;
+  int sign = weight > 0 ? 1 : -1;
+
+  if (weight)
+  {
+    *accum += (unsigned)(weight < 0 ? -weight : weight);
+    if (*accum >= threshold)
+    {
+      *accum -= threshold;
+      *hold_remaining = hold_frames;
+      *hold_direction = sign;
+    }
+  }
+
+  if (*hold_remaining)
+  {
+    (*hold_remaining)--;
+    return *hold_direction;
+  }
+  if (!weight)
+    *hold_direction = 0;
+  return 0;
+}
+
+/* Anchor based movement latches its normalized angle until another valid
+ * glide step arrives or contact ends. X/Y remain independent for diagonals. */
+static void touchpad_glide_update(const touchpad_report_t *report)
+{
+  static const unsigned alpha_q12[3] = { 2662u, 1638u, 1024u };
+  int dx, dy, vx, vy, new_wx, new_wy;
+  unsigned weight_x, weight_y, deadzone, abs_vx, abs_vy;
+  unsigned magnitude_sq, deadzone_sq, magnitude;
+  unsigned smoothing, strength, hold_frames;
+
+  if (!nspire_touchpad_glide_enabled)
+  {
+    if (glide_was_enabled)
+      touchpad_glide_reset();
+    glide_was_enabled = 0;
+    return;
+  }
+  glide_was_enabled = 1;
+  smoothing = nspire_touchpad_glide_smoothing % 2u;
+  strength = nspire_touchpad_glide_smooth_strength % 3u;
+  hold_frames = strength == GLIDE_SMOOTH_HIGH ? 3u : 2u;
+  if (!glide_smoothing_mode_known || glide_smoothing_mode != smoothing)
+  {
+    glide_smooth_vx = glide_smooth_vy = 0;
+    glide_hysteresis_x_active = smoothing && glide_latched_wx != 0;
+    glide_hysteresis_y_active = smoothing && glide_latched_wy != 0;
+    glide_accum_x = glide_accum_y = smoothing ? GLIDE_WEIGHT_ONE * hold_frames : 0;
+    glide_hold_remaining_x = glide_hold_remaining_y = 0;
+    glide_hold_direction_x = glide_hold_direction_y = 0;
+    glide_smoothing_mode = smoothing;
+    glide_smoothing_mode_known = 1;
+  }
+  if (!touchpad_available)
+  {
+    touchpad_glide_reset();
+    return;
+  }
+  if (!report->contact)
+  {
+    touchpad_glide_reset();
+    return;
+  }
+  if (!glide_was_touching)
+  {
+    glide_anchor_x = (int)report->x;
+    glide_anchor_y = (int)report->y;
+    glide_was_touching = 1;
+    glide_latched_wx = glide_latched_wy = 0;
+    glide_smooth_vx = glide_smooth_vy = 0;
+    glide_hysteresis_x_active = glide_hysteresis_y_active = 0;
+    glide_accum_x = glide_accum_y = 0;
+    glide_hold_remaining_x = glide_hold_remaining_y = 0;
+    glide_hold_direction_x = glide_hold_direction_y = 0;
+    memset(glide_current_buttons, 0, sizeof(glide_current_buttons));
+    return;
+  }
+
+  dx = (int)report->x - glide_anchor_x;
+  dy = (int)report->y - glide_anchor_y;
+  if (nspire_touchpad_glide_invert_x)
+    dx = -dx;
+  if (nspire_touchpad_glide_invert_y)
+    dy = -dy;
+
+  if (nspire_touchpad_glide_aspect_mode == GLIDE_ASPECT_EQUAL)
+  {
+    weight_x = weight_y = 1;
+  }
+  else
+  {
+    weight_x = 4;
+    weight_y = 3;
+  }
+
+  /* Q12 normalized displacement. The deadzone is a percentage of the
+   * shorter weighted touchpad span (3 in 4:3 mode, 1 in equal mode). */
+  vx = (dx * (int)weight_x * (int)GLIDE_WEIGHT_ONE) / (int)touchpad_width;
+  vy = (dy * (int)weight_y * (int)GLIDE_WEIGHT_ONE) / (int)touchpad_height;
+  abs_vx = (unsigned)(vx < 0 ? -vx : vx);
+  abs_vy = (unsigned)(vy < 0 ? -vy : vy);
+  magnitude_sq = abs_vx * abs_vx + abs_vy * abs_vy;
+  deadzone = (nspire_touchpad_glide_deadzone % (GLIDE_DEADZONE_MAX + 1u)) *
+             GLIDE_WEIGHT_ONE * (weight_y == 3 ? 3u : 1u) / 100u;
+  deadzone_sq = deadzone * deadzone;
+
+  if (magnitude_sq && magnitude_sq >= deadzone_sq)
+  {
+    if (smoothing)
+    {
+      unsigned alpha = alpha_q12[strength];
+      glide_smooth_vx = ((int)alpha * vx +
+        (int)(GLIDE_WEIGHT_ONE - alpha) * glide_smooth_vx) /
+        (int)GLIDE_WEIGHT_ONE;
+      glide_smooth_vy = ((int)alpha * vy +
+        (int)(GLIDE_WEIGHT_ONE - alpha) * glide_smooth_vy) /
+        (int)GLIDE_WEIGHT_ONE;
+      vx = glide_smooth_vx;
+      vy = glide_smooth_vy;
+    }
+
+    abs_vx = (unsigned)(vx < 0 ? -vx : vx);
+    abs_vy = (unsigned)(vy < 0 ? -vy : vy);
+    magnitude_sq = abs_vx * abs_vx + abs_vy * abs_vy;
+    magnitude = touchpad_glide_isqrt(magnitude_sq);
+    if (magnitude)
+    {
+      new_wx = (vx * (int)GLIDE_WEIGHT_ONE) / (int)magnitude;
+      new_wy = (vy * (int)GLIDE_WEIGHT_ONE) / (int)magnitude;
+
+      if (smoothing)
+      {
+        unsigned abs_wx = (unsigned)(new_wx < 0 ? -new_wx : new_wx);
+        unsigned abs_wy = (unsigned)(new_wy < 0 ? -new_wy : new_wy);
+        if (glide_hysteresis_x_active)
+        {
+          if (abs_wx * 10u < GLIDE_WEIGHT_ONE)
+            glide_hysteresis_x_active = 0;
+        }
+        else if (abs_wx * 5u >= GLIDE_WEIGHT_ONE)
+        {
+          glide_hysteresis_x_active = 1;
+        }
+        if (glide_hysteresis_y_active)
+        {
+          if (abs_wy * 10u < GLIDE_WEIGHT_ONE)
+            glide_hysteresis_y_active = 0;
+        }
+        else if (abs_wy * 5u >= GLIDE_WEIGHT_ONE)
+        {
+          glide_hysteresis_y_active = 1;
+        }
+        if (!glide_hysteresis_x_active) new_wx = 0;
+        if (!glide_hysteresis_y_active) new_wy = 0;
+      }
+      else if ((unsigned)(new_wx < 0 ? -new_wx : new_wx) <= GLIDE_WEIGHT_ONE / 10u)
+      {
+        /* Preserve the original cardinal snap whenever smoothing is off. */
+        new_wx = 0;
+        new_wy = vy < 0 ? -(int)GLIDE_WEIGHT_ONE : (int)GLIDE_WEIGHT_ONE;
+      }
+      else if ((unsigned)(new_wy < 0 ? -new_wy : new_wy) <= GLIDE_WEIGHT_ONE / 10u)
+      {
+        new_wy = 0;
+        new_wx = vx < 0 ? -(int)GLIDE_WEIGHT_ONE : (int)GLIDE_WEIGHT_ONE;
+      }
+
+      /* Prime a changed axis for an immediate first pulse; same-direction
+       * movement retains its fractional remainder for smooth duty cycling. */
+      if (!new_wx)
+        glide_accum_x = 0;
+      else if (!glide_latched_wx || ((glide_latched_wx < 0) != (new_wx < 0)))
+      {
+        glide_accum_x = smoothing ? GLIDE_WEIGHT_ONE * hold_frames : GLIDE_WEIGHT_ONE;
+        glide_hold_remaining_x = 0;
+        glide_hold_direction_x = 0;
+      }
+      if (!new_wy)
+        glide_accum_y = 0;
+      else if (!glide_latched_wy || ((glide_latched_wy < 0) != (new_wy < 0)))
+      {
+        glide_accum_y = smoothing ? GLIDE_WEIGHT_ONE * hold_frames : GLIDE_WEIGHT_ONE;
+        glide_hold_remaining_y = 0;
+        glide_hold_direction_y = 0;
+      }
+
+      glide_latched_wx = new_wx;
+      glide_latched_wy = new_wy;
+    }
+    glide_anchor_x = (int)report->x;
+    glide_anchor_y = (int)report->y;
+  }
+
+  /* A sub-deadzone pause leaves the anchor and latched weights untouched, so
+   * the last direction keeps pulsing until movement changes it or contact lifts. */
+  memset(glide_current_buttons, 0, sizeof(glide_current_buttons));
+  if (smoothing)
+  {
+    int active_x = touchpad_glide_axis_held(glide_latched_wx, &glide_accum_x,
+      &glide_hold_remaining_x, &glide_hold_direction_x, hold_frames);
+    int active_y = touchpad_glide_axis_held(glide_latched_wy, &glide_accum_y,
+      &glide_hold_remaining_y, &glide_hold_direction_y, hold_frames);
+    if (active_x)
+      glide_current_buttons[active_x > 0 ? GLIDE_DIR_RIGHT : GLIDE_DIR_LEFT] =
+        nspire_touchpad_glide_masks[active_x > 0 ? GLIDE_DIR_RIGHT : GLIDE_DIR_LEFT];
+    if (active_y)
+      glide_current_buttons[active_y > 0 ? GLIDE_DIR_UP : GLIDE_DIR_DOWN] =
+        nspire_touchpad_glide_masks[active_y > 0 ? GLIDE_DIR_UP : GLIDE_DIR_DOWN];
+  }
+  else
+  {
+    glide_hold_remaining_x = glide_hold_remaining_y = 0;
+    glide_hold_direction_x = glide_hold_direction_y = 0;
+    if (touchpad_glide_axis_pulse(glide_latched_wx, &glide_accum_x))
+      glide_current_buttons[glide_latched_wx > 0 ? GLIDE_DIR_RIGHT : GLIDE_DIR_LEFT] =
+        nspire_touchpad_glide_masks[glide_latched_wx > 0 ? GLIDE_DIR_RIGHT : GLIDE_DIR_LEFT];
+    if (touchpad_glide_axis_pulse(glide_latched_wy, &glide_accum_y))
+      glide_current_buttons[glide_latched_wy > 0 ? GLIDE_DIR_UP : GLIDE_DIR_DOWN] =
+        nspire_touchpad_glide_masks[glide_latched_wy > 0 ? GLIDE_DIR_UP : GLIDE_DIR_DOWN];
+  }
+}
 
 static void touchpad_get_size(void)
 {
-  if (!touchpad_size_checked)
-  {
-    touchpad_info_t *info = touchpad_getinfo();
-    if (info && info->width && info->height)
-    {
-      touchpad_width = info->width;
-      touchpad_height = info->height;
-    }
-    /* The fallback is deliberately 4:3, matching the CX II CAS touchpad. */
-    touchpad_size_checked = 1;
-  }
+  touchpad_initialize();
 }
 
 static void set_virtual_key(u32 *mask, unsigned key)
@@ -217,6 +537,7 @@ void keys_poll(void)
   unsigned i;
 
   memset(&report, 0, sizeof(report));
+  touchpad_initialize();
   touchpad_scan(&report);
   current_touchpad_arrow = report.arrow;
   if (nspire_touchpad_swipe)
@@ -252,6 +573,8 @@ void keys_poll(void)
   current_keys[2] = HW_READ(HW_KEYPAD + 8);
   current_keys[3] = (HW_READ(HW_KEYPAD + 12) & TOUCHPAD_KEYS_MASK) | touchpad_pressed;
   current_keys[4] = touchpad_swipe_keys(&report);
+  if (nspire_touchpad_glide_enabled || glide_was_enabled)
+    touchpad_glide_update(&report);
 
   for (i = 0; i < NUM_KEY_WORDS; i++)
     new_keys[i] &= current_keys[i];
@@ -475,46 +798,273 @@ static unsigned short active_multi_action_mask(void)
   return mask;
 }
 
+#define MAX_ACTIVE_INPUT_SOURCES 48u
+
+typedef struct
+{
+  u16 mask;
+  u8 bit_count;
+} ActiveInputSource;
+
+static u16 action_mask_to_buttons(unsigned short action_mask)
+{
+  u16 buttons = 0;
+  unsigned i;
+  for (i = 0; i < NUM_GBA_ACTIONS; i++)
+    if (action_mask & (1u << i))
+      buttons |= touchpad_glide_button_bits[i];
+  return buttons;
+}
+
+static u8 input_mask_bit_count(u16 mask)
+{
+  u8 count = 0;
+  while (mask)
+  {
+    mask &= (u16)(mask - 1u);
+    count++;
+  }
+  return count;
+}
+
+static void append_input_source(ActiveInputSource *sources, unsigned *count,
+                                u16 mask)
+{
+  if (mask && *count < MAX_ACTIVE_INPUT_SOURCES)
+  {
+    sources[*count].mask = mask;
+    sources[*count].bit_count = input_mask_bit_count(mask);
+    (*count)++;
+  }
+}
+
+static int same_binding(key_binding a, key_binding b)
+{
+  return a.key == b.key && a.with == b.with;
+}
+
+#define MAX_COLLECTED_BINDINGS (NUM_GBA_ACTIONS * KEY_SLOTS + NUM_COMBO_SLOTS + NUM_SWIPE_DIRS + 4)
+
+typedef struct
+{
+  key_binding trigger;
+  u16 mask;
+} CollectedBinding;
+
+/* Reuse one entry for every mapping attached to the same active calculator
+ * trigger, so one key that maps to several buttons remains one source. */
+static int collected_binding_index(CollectedBinding *bindings, unsigned *count,
+                                   key_binding trigger)
+{
+  unsigned i;
+  for (i = 0; i < *count; i++)
+    if (same_binding(bindings[i].trigger, trigger))
+      return (int)i;
+  if (*count >= MAX_COLLECTED_BINDINGS)
+    return -1;
+  bindings[*count].trigger = trigger;
+  bindings[*count].mask = 0;
+  return (int)(*count)++;
+}
+
+static unsigned collect_active_input_sources(ActiveInputSource *sources)
+{
+  static const unsigned char arrow_keys[4] =
+    { KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT };
+  CollectedBinding bindings[MAX_COLLECTED_BINDINGS];
+  unsigned binding_count = 0;
+  unsigned count = 0, action, slot, i;
+
+  for (action = 0; action < NUM_GBA_ACTIONS; action++)
+    for (slot = 0; slot < KEY_SLOTS; slot++)
+    {
+      key_binding trigger = key_bindings[action][slot];
+      int index;
+      if (!trigger.key || !binding_held(trigger))
+        continue;
+      index = collected_binding_index(bindings, &binding_count, trigger);
+      if (index >= 0)
+        bindings[index].mask |= touchpad_glide_button_bits[action];
+    }
+
+  for (i = 0; i < NUM_COMBO_SLOTS; i++)
+  {
+    key_binding trigger = combo_bindings[i].trigger;
+    int index;
+    if (!combo_bindings[i].action_mask || !binding_held(trigger))
+      continue;
+    index = collected_binding_index(bindings, &binding_count, trigger);
+    if (index >= 0)
+      bindings[index].mask |= action_mask_to_buttons(combo_bindings[i].action_mask);
+  }
+
+  /* Swipe directions and raw touchpad arrows share a source with any
+   * configured key or macro mapping on that same trigger. */
+  for (i = 0; i < NUM_SWIPE_DIRS; i++)
+  {
+    key_binding swipe = { (unsigned char)(KEY_SWIPE_UP + i), 0 };
+    if (key_down(swipe.key))
+    {
+      int index = collected_binding_index(bindings, &binding_count, swipe);
+      if (index >= 0)
+        bindings[index].mask |= action_mask_to_buttons(swipe_action_masks[i]);
+    }
+  }
+  for (i = 0; i < 4; i++)
+  {
+    key_binding arrow = { arrow_keys[i], 0 };
+    if (key_down(arrow.key))
+    {
+      int index = collected_binding_index(bindings, &binding_count, arrow);
+      if (index >= 0)
+        bindings[index].mask |= touchpad_glide_button_bits[i];
+    }
+  }
+
+  for (i = 0; i < binding_count; i++)
+    append_input_source(sources, &count, bindings[i].mask);
+
+  /* The number-pad corner shortcuts are one physical input each, with a
+   * two-button map. Keep the old bound-key suppression rule. */
+  if (key_down(KEY_7) && !key_is_bound(KEY_7))
+    append_input_source(sources, &count, BUTTON_UP | BUTTON_LEFT);
+  if (key_down(KEY_9) && !key_is_bound(KEY_9))
+    append_input_source(sources, &count, BUTTON_UP | BUTTON_RIGHT);
+  if (key_down(KEY_1) && !key_is_bound(KEY_1))
+    append_input_source(sources, &count, BUTTON_DOWN | BUTTON_LEFT);
+  if (key_down(KEY_3) && !key_is_bound(KEY_3))
+    append_input_source(sources, &count, BUTTON_DOWN | BUTTON_RIGHT);
+
+  if (nspire_touchpad_glide_enabled)
+    for (i = 0; i < NUM_GLIDE_DIRS; i++)
+      append_input_source(sources, &count, glide_current_buttons[i]);
+
+  return count;
+}
+
+static u16 schedule_input_layers(const ActiveInputSource *sources,
+                                 unsigned source_count, unsigned mode,
+                                 unsigned slice_frames)
+{
+  u16 layers[MAX_ACTIVE_INPUT_SOURCES];
+  unsigned layer_count = 0, i;
+
+  if (mode == INPUT_SEPARATION_SMART)
+  {
+    u16 base_layer = 0;
+    for (i = 0; i < source_count; i++)
+      if (sources[i].bit_count == 1)
+        base_layer |= sources[i].mask;
+    if (base_layer)
+      layers[layer_count++] = base_layer;
+    for (i = 0; i < source_count; i++)
+      if (sources[i].bit_count >= 2)
+        layers[layer_count++] = sources[i].mask;
+  }
+  else
+  {
+    for (i = 0; i < source_count; i++)
+      layers[layer_count++] = sources[i].mask;
+  }
+
+  if (!layer_count)
+  {
+    input_current_layer_idx = 0;
+    input_slice_frame_counter = 0;
+    return 0;
+  }
+  if (layer_count == 1)
+  {
+    input_current_layer_idx = 0;
+    input_slice_frame_counter = 0;
+    return layers[0];
+  }
+  if (input_current_layer_idx >= layer_count)
+  {
+    input_current_layer_idx = 0;
+    input_slice_frame_counter = 0;
+  }
+
+  {
+    u16 buttons = layers[input_current_layer_idx];
+    input_slice_frame_counter++;
+    if (input_slice_frame_counter >= slice_frames)
+    {
+      input_slice_frame_counter = 0;
+      input_current_layer_idx = (input_current_layer_idx + 1) % layer_count;
+    }
+    return buttons;
+  }
+}
+
 /* Reads the keys for a frame: sets the GBA's buttons and returns the hotkeys
  * just pressed, one bit per action (1 << ACTION_MENU, ...). */
 u32 nspire_input_frame(void)
 {
   u32 gba_buttons = 0, hotkeys = 0;
+  ActiveInputSource active_sources[MAX_ACTIVE_INPUT_SOURCES];
+  unsigned active_source_count, separation_mode, slice_frames;
   unsigned short multi_mask;
   int up, down, left, right, i;
 
   keys_poll();
-  multi_mask = active_multi_action_mask();
-
-  up    = key_down(KEY_UP)    || action_held(ACTION_UP)    || ((multi_mask & (1u << ACTION_UP)) != 0);
-  down  = key_down(KEY_DOWN)  || action_held(ACTION_DOWN)  || ((multi_mask & (1u << ACTION_DOWN)) != 0);
-  left  = key_down(KEY_LEFT)  || action_held(ACTION_LEFT)  || ((multi_mask & (1u << ACTION_LEFT)) != 0);
-  right = key_down(KEY_RIGHT) || action_held(ACTION_RIGHT) || ((multi_mask & (1u << ACTION_RIGHT)) != 0);
-  /* The number pad's corners are diagonals, unless bound to something. */
-  if (key_down(KEY_7) && !key_is_bound(KEY_7)) up = left = 1;
-  if (key_down(KEY_9) && !key_is_bound(KEY_9)) up = right = 1;
-  if (key_down(KEY_1) && !key_is_bound(KEY_1)) down = left = 1;
-  if (key_down(KEY_3) && !key_is_bound(KEY_3)) down = right = 1;
-  if (up && down)
-    up = down = 0;
-  if (left && right)
-    left = right = 0;
-
-  if (up)    gba_buttons |= BUTTON_UP;
-  if (down)  gba_buttons |= BUTTON_DOWN;
-  if (left)  gba_buttons |= BUTTON_LEFT;
-  if (right) gba_buttons |= BUTTON_RIGHT;
-  if (action_held(ACTION_A)      || (multi_mask & (1u << ACTION_A)))      gba_buttons |= BUTTON_A;
-  if (action_held(ACTION_B)      || (multi_mask & (1u << ACTION_B)))      gba_buttons |= BUTTON_B;
-  if (action_held(ACTION_L)      || (multi_mask & (1u << ACTION_L)))      gba_buttons |= BUTTON_L;
-  if (action_held(ACTION_R)      || (multi_mask & (1u << ACTION_R)))      gba_buttons |= BUTTON_R;
-  if (action_held(ACTION_START)  || (multi_mask & (1u << ACTION_START)))  gba_buttons |= BUTTON_START;
-  if (action_held(ACTION_SELECT) || (multi_mask & (1u << ACTION_SELECT))) gba_buttons |= BUTTON_SELECT;
-
-  if (serial_mode == SERIAL_MODE_GBP)
+  separation_mode = nspire_input_separation_mode % 3u;
+  if (separation_mode != input_previous_separation_mode)
   {
-    if (frame_counter > 20 && frame_counter < 100)
-      gba_buttons = (frame_counter % 3) ? 0x3FF : 0x30F;
+    input_current_layer_idx = 0;
+    input_slice_frame_counter = 0;
+    input_previous_separation_mode = separation_mode;
+  }
+
+  /* Separation collects each source before choosing a layer. The legacy path
+   * below remains unchanged when the option is off (or GBP serial mode owns it). */
+  if (separation_mode != INPUT_SEPARATION_OFF && serial_mode != SERIAL_MODE_GBP)
+  {
+    active_source_count = collect_active_input_sources(active_sources);
+    slice_frames = nspire_input_slice_frames;
+    if (slice_frames < 1u || slice_frames > 6u)
+      slice_frames = 2u;
+    gba_buttons = schedule_input_layers(active_sources, active_source_count,
+                                        separation_mode, slice_frames);
+  }
+  else
+  {
+    multi_mask = active_multi_action_mask();
+    up    = key_down(KEY_UP)    || action_held(ACTION_UP)    || ((multi_mask & (1u << ACTION_UP)) != 0);
+    down  = key_down(KEY_DOWN)  || action_held(ACTION_DOWN)  || ((multi_mask & (1u << ACTION_DOWN)) != 0);
+    left  = key_down(KEY_LEFT)  || action_held(ACTION_LEFT)  || ((multi_mask & (1u << ACTION_LEFT)) != 0);
+    right = key_down(KEY_RIGHT) || action_held(ACTION_RIGHT) || ((multi_mask & (1u << ACTION_RIGHT)) != 0);
+    /* The number pad's corners are diagonals, unless bound to something. */
+    if (key_down(KEY_7) && !key_is_bound(KEY_7)) up = left = 1;
+    if (key_down(KEY_9) && !key_is_bound(KEY_9)) up = right = 1;
+    if (key_down(KEY_1) && !key_is_bound(KEY_1)) down = left = 1;
+    if (key_down(KEY_3) && !key_is_bound(KEY_3)) down = right = 1;
+    if (up && down)
+      up = down = 0;
+    if (left && right)
+      left = right = 0;
+
+    if (up)    gba_buttons |= BUTTON_UP;
+    if (down)  gba_buttons |= BUTTON_DOWN;
+    if (left)  gba_buttons |= BUTTON_LEFT;
+    if (right) gba_buttons |= BUTTON_RIGHT;
+    if (action_held(ACTION_A)      || (multi_mask & (1u << ACTION_A)))      gba_buttons |= BUTTON_A;
+    if (action_held(ACTION_B)      || (multi_mask & (1u << ACTION_B)))      gba_buttons |= BUTTON_B;
+    if (action_held(ACTION_L)      || (multi_mask & (1u << ACTION_L)))      gba_buttons |= BUTTON_L;
+    if (action_held(ACTION_R)      || (multi_mask & (1u << ACTION_R)))      gba_buttons |= BUTTON_R;
+    if (action_held(ACTION_START)  || (multi_mask & (1u << ACTION_START)))  gba_buttons |= BUTTON_START;
+    if (action_held(ACTION_SELECT) || (multi_mask & (1u << ACTION_SELECT))) gba_buttons |= BUTTON_SELECT;
+
+    if (serial_mode == SERIAL_MODE_GBP)
+    {
+      if (frame_counter > 20 && frame_counter < 100)
+        gba_buttons = (frame_counter % 3) ? 0x3FF : 0x30F;
+    }
+
+    /* Glide remains a non-destructive OR addition in the legacy mode. */
+    if (nspire_touchpad_glide_enabled)
+      for (i = 0; i < NUM_GLIDE_DIRS; i++)
+        gba_buttons |= glide_current_buttons[i];
   }
 
   if ((gba_buttons | old_key) != old_key)
@@ -536,10 +1086,17 @@ u32 nspire_input_frame(void)
 void nspire_input_release_all(void)
 {
   old_key = 0;
+  touchpad_glide_reset();
+  input_current_layer_idx = 0;
+  input_slice_frame_counter = 0;
+  input_previous_separation_mode = nspire_input_separation_mode % 3u;
   write_ioreg(REG_P1, 0x3FF);
 }
 
-void init_input(void) {}
+void init_input(void)
+{
+  touchpad_initialize();
+}
 
 bool input_check_savestate(const u8 *src)
 {
